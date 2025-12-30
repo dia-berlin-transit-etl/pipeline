@@ -5,11 +5,10 @@ Extract the content you unzip from the folders `/DBahn-berlin/timetable` and `/D
 ```
 .
 ├── DBahn-berlin
-│   ├── readme.md
-│   ├── schema.json
-│   ├── station_data.json
+│   ├── ...
 │   ├── timetable_changes
 │   └── timetables
+├── ...
 ├── timetable_changes
 └── timetables
 ```
