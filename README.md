@@ -235,6 +235,31 @@ Example:
     - Not in the XML fields you listed, but you must take it from the folder name (e.g., `2509021600`) because tasks ask "at a time snapshot (date hour)".
 
 
-## The Schema
+## The Star Schema
+
+Three dimensions and one fact table.
 
 ![Schema ERD](schema_erd.png)
+
+## Postgres CLI How-To
+
+Create database:
+```
+sudo -u postgres psql
+postgres=# create database public_transport_db owner USER;
+```
+
+Connect to the database:
+```
+psql -U USER -h localhost -d public_transport_db
+```
+
+Drop schema:
+```
+DROP SCHEMA IF EXISTS dw CASCADE;
+```
+
+Create schema:
+```
+\i /path/to/schema.sql
+```
