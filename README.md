@@ -233,3 +233,8 @@ Example:
         _(This example doesn’t show `cs`, but it will appear in other records.)_
 - Snapshot timestamp
     - Not in the XML fields you listed, but you must take it from the folder name (e.g., `2509021600`) because tasks ask "at a time snapshot (date hour)".
+
+
+## The Schema
+
+![Schema ERD](schema_erd.png)
