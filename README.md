@@ -241,7 +241,26 @@ Three dimensions and one fact table.
 
 ![Schema ERD](schema_erd.png)
 
-## Postgres CLI How-To
+## Ingestion:
+
+Create `.pgpass` file such that:
+```sh
+cat ~/.pgpass
+localhost:5432:public_transport_db:user:password
+```
+
+and give the permissions:
+```sh
+chmod 600 ~/.pgpass
+```
+
+Run the script:
+```sh
+python ingestion.py
+```
+
+
+## Postgres CLI
 
 Create database:
 ```
@@ -262,4 +281,25 @@ DROP SCHEMA IF EXISTS dw CASCADE;
 Create schema:
 ```
 \i /path/to/schema.sql
+```
+
+## Give Your User Permission
+
+Open psql as postgres (or whoever owns `dw`):
+```
+sudo -u postgres psql -d public_transport_db
+```
+
+Then run:
+```sql
+-- allow user to access objects inside schema
+GRANT USAGE ON SCHEMA dw TO efe;
+
+-- allow inserting/updating the dimension + fact tables (start with dim_station)
+GRANT SELECT, INSERT, UPDATE ON dw.dim_station TO efe;
+
+-- if you will load other tables too, grant them now:
+GRANT SELECT, INSERT, UPDATE ON dw.dim_train TO efe;
+GRANT SELECT, INSERT, UPDATE ON dw.dim_time TO efe;
+GRANT SELECT, INSERT, UPDATE ON dw.fact_movement TO efe;
 ```
