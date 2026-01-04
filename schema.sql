@@ -44,6 +44,8 @@ create table if not exists dw.fact_movement (
 
     arrival_delay_min integer,
     departure_delay_min integer,
+    
+    is_hidden boolean not null default false,
 
     unique (snapshot_key, station_eva, stop_id),
 
