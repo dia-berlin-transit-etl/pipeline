@@ -303,3 +303,19 @@ GRANT SELECT, INSERT, UPDATE ON dw.dim_train TO efe;
 GRANT SELECT, INSERT, UPDATE ON dw.dim_time TO efe;
 GRANT SELECT, INSERT, UPDATE ON dw.fact_movement TO efe;
 ```
+
+## Setup
+
+1. **Create and activate a virtual environment**
+
+   ```bash
+   python -m venv venv
+   source venv/bin/activate      # On macOS/Linux
+   venv\Scripts\activate         # On Windows
+   ```
+
+2. **Install dependencies**
+
+   ```bash
+   pip install -r requirements.txt
+   ```
