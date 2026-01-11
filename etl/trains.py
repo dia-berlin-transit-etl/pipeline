@@ -10,7 +10,6 @@ import xml.etree.ElementTree as ET
 def upsert_dim_train_from_timetables(cur, timetables_glob: str) -> Dict[Tuple[str, str], int]:
     """
     Extracts (tl/@c, tl/@n) from timetable XMLs and upserts into dw.dim_train.
-
     Returns mapping: (category, train_number) -> train_id
     """
     pairs: set[Tuple[str, str]] = set()

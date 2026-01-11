@@ -3,8 +3,35 @@ create schema if not exists dw;
 create table if not exists dw.dim_station (
     station_eva bigint primary key,
     station_name text not null,
+    station_name_search text not null, -- NEW
     lon double precision not null,
     lat double precision not null
+);
+
+-- keeps every resolution attempt (top candidate + score)
+create table if not exists dw.station_resolve_log (
+    id bigserial primary key,
+    snapshot_key text not null,
+    source_path text not null,
+    station_raw text not null,
+    station_search text not null,
+    best_station_eva bigint,
+    best_station_name text,
+    best_score double precision,
+    auto_linked boolean not null,
+    created_at timestamp not null default now()
+);
+
+-- only “borderline/failed” cases
+create table if not exists dw.needs_review (
+    station_search text primary key,     -- de-dupe by normalized/search string
+    station_raw text not null,
+    best_station_eva bigint,
+    best_station_name text,
+    best_score double precision,
+    last_snapshot_key text not null,
+    last_source_path text not null,
+    last_seen_at timestamp not null default now()
 );
 
 create table if not exists dw.dim_train (
@@ -58,3 +85,7 @@ create table if not exists dw.fact_movement (
     constraint fk_fact_train
         foreign key (train_id) references dw.dim_train(train_id)
 );
+
+-- index for fuzzy matching (requires pg_trgm extension)
+create index if not exists dim_station_name_trgm_idx
+on dw.dim_station using gin (station_name_search gin_trgm_ops);
