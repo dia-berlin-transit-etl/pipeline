@@ -4,8 +4,9 @@ from __future__ import annotations
 import argparse
 import psycopg2
 
-from etl.ingest_stations import upsert_dim_station_from_json, print_dim_station_preview
-from etl.ingest_trains import upsert_dim_train_from_timetables
+from etl.stations import upsert_dim_station_from_json, print_dim_station_preview
+from etl.trains import upsert_dim_train_from_timetables
+from etl.time_dim import upsert_dim_time_from_paths, print_dim_time_preview
 
 
 
@@ -23,8 +24,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Ingest Berlin DB dataset into Postgres DW schema.")
     ap.add_argument(
         "--step",
-        choices=["stations", "trains"],
-        help="Which ingestion step to run (start simple; add more steps later).",
+        choices=["stations", "trains", "time"],
+        help="Which ingestion step to run.",
     )
     
     args = ap.parse_args()
@@ -46,6 +47,7 @@ def main() -> None:
                 print("\nSample normalized-name -> EVA mapping (first 10):")
                 for k, v in sample:
                     print(f"- {k} -> {v}")
+            
             elif args.step in ("trains"):
                 train_map = upsert_dim_train_from_timetables(cur, "timetables/**/*.xml")
                 conn.commit()
@@ -65,7 +67,14 @@ def main() -> None:
                 print("\nFirst 20 trains:")
                 for c, n in cur.fetchall():
                     print(f"- {c} {n}")
-
+            
+            elif args.step in ("time"):
+                keys = upsert_dim_time_from_paths(
+                    cur,
+                    snapshot_globs=["timetables/**/*.xml", "timetable_changes/**/*.xml"],
+                )
+                conn.commit()
+                print_dim_time_preview(cur, limit=30)
 
     except Exception:
         conn.rollback()
