@@ -319,3 +319,16 @@ GRANT SELECT, INSERT, UPDATE ON dw.fact_movement TO efe;
    ```bash
    pip install -r requirements.txt
    ```
+
+## Running the ingestion scripts
+
+Run the scripts in this order:
+
+```sh
+python ingestion.py --step stations
+python ingestion.py --step trains
+python ingestion.py --step time
+python ingestion.py --step planned --snapshot 2509021400 --threshold 0.75
+# python ingestion.py --step changed (coming soon...)
+```
+
