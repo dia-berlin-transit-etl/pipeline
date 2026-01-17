@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 def upsert_dim_train_from_timetables(cur, timetables_glob: str) -> Dict[Tuple[str, str], int]:
     """
     Extracts (tl/@c, tl/@n) from timetable XMLs and upserts into dw.dim_train.
+    Filters out category == 'Bus' (case-insensitive).
     Returns mapping: (category, train_number) -> train_id
     """
     pairs: set[Tuple[str, str]] = set()
@@ -18,15 +19,22 @@ def upsert_dim_train_from_timetables(cur, timetables_glob: str) -> Dict[Tuple[st
         try:
             root = ET.parse(path).getroot()
         except ET.ParseError:
-            # If a file is malformed, skip it.
             continue
 
         for tl in root.findall(".//tl"):
-            c = tl.get("c")  # category, e.g. RE/RB/ICE
+            c = tl.get("c")  # category
             n = tl.get("n")  # train number as string
             if not c or not n:
                 continue
-            pairs.add((c.strip(), n.strip()))
+
+            c = c.strip()
+            n = n.strip()
+
+            # FILTER: skip buses
+            if c.lower() == "bus":
+                continue
+
+            pairs.add((c, n))
 
     rows = list(pairs)
     if rows:
@@ -45,6 +53,9 @@ def upsert_dim_train_from_timetables(cur, timetables_glob: str) -> Dict[Tuple[st
     cur.execute("select train_id, category, train_number from dw.dim_train;")
     train_map: Dict[Tuple[str, str], int] = {}
     for train_id, category, train_number in cur.fetchall():
-        train_map[(category, train_number)] = train_id
+        # keep map consistent with filter too (defensive)
+        if (category or "").strip().lower() == "bus":
+            continue
+        train_map[(category, train_number)] = int(train_id)
 
     return train_map

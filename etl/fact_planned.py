@@ -1,3 +1,4 @@
+# fact_planned.py (updated to ingest ALL snapshots under timetables/)
 from __future__ import annotations
 
 import glob
@@ -5,7 +6,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import psycopg2.extras
 import xml.etree.ElementTree as ET
@@ -51,13 +52,13 @@ def get_prev_next_station_raw(
         ar_path = ar.get("cpth") or ar.get("ppth")
         ar_list = _split_path_list(ar_path)
         if ar_list:
-            prev_raw = ar_list[-1]  # immediate previous
+            prev_raw = ar_list[-1]
 
     if dp is not None and not dp_hidden:
         dp_path = dp.get("cpth") or dp.get("ppth")
         dp_list = _split_path_list(dp_path)
         if dp_list:
-            next_raw = dp_list[0]  # immediate next
+            next_raw = dp_list[0]
 
     return prev_raw, next_raw
 
@@ -86,8 +87,12 @@ def parse_yyMMddHHmm(ts: Optional[str]) -> Optional[datetime]:
     return datetime(2000 + yy, mm, dd, hh, mi)
 
 
+def _core_tokens(station_search: str) -> List[str]:
+    return [t for t in station_search.split() if len(t) >= 2 and t not in GENERIC]
+
+
 def _core_token_regex(station_search: str) -> Optional[str]:
-    toks = [t for t in station_search.split() if len(t) >= 2 and t not in GENERIC]
+    toks = _core_tokens(station_search)
     if not toks:
         return None
     # whole-word match for any core token
@@ -100,8 +105,8 @@ def _core_search_string(station_search: str) -> str:
     Remove GENERIC tokens (and 1-char junk) from a normalized station_search string.
     Used for scoring so that qualifiers like 's bahn' don't drag the similarity down.
     """
-    toks = [t for t in station_search.split() if len(t) >= 2 and t not in GENERIC]
-    return " ".join(toks).strip()
+    toks = _core_tokens(station_search)
+    return " ".join(toks)
 
 
 def to_station_search_name(name: str) -> str:
@@ -154,40 +159,30 @@ def resolve_station_eva(
     cache: Optional[Dict[str, Optional[int]]] = None,
 ) -> Optional[int]:
     """
-    Uses pg_trgm similarity on dim_station.station_name_search.
-
-    PRINCIPLED CHANGE:
-      - Candidate gating uses regex over CORE TOKENS (non-generic)
-      - Scoring uses similarity() against CORE-ONLY string,
-        so extra qualifiers (e.g. '(S-Bahn)') don't lower the score.
-
+    Candidate restriction uses core tokens.
+    Scoring uses core-search-string so that qualifiers like '(S-Bahn)' don't drag score down.
     Logs top candidate + score ALWAYS (station_resolve_log).
     Auto-links only if score >= threshold; else upserts into needs_review.
     """
-
-    station_search = to_station_search_name(station_raw)
-    if not station_search:
+    station_search_full = to_station_search_name(station_raw)
+    if not station_search_full:
         return None
 
-    if cache is not None and station_search in cache:
-        return cache[station_search]
+    # Use core string for scoring + caching (so "Berlin Hbf (S-Bahn)" and "Berlin Hbf" share cache)
+    score_query = _core_search_string(station_search_full) or station_search_full
+    cache_key = score_query
 
-    core_pat = _core_token_regex(station_search)
-    core_search = _core_search_string(station_search)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
 
-    has_core = bool(core_pat)  # at least one non-generic token exists
-    # If it’s generic-only, we still allow candidate search, but we DO NOT auto-link.
-    score_query = core_search if core_search else station_search
+    core_pat = _core_token_regex(station_search_full)
+    has_core = bool(core_pat)
 
-    # Find best candidate by trigram distance, compute similarity score
     if core_pat:
-        # Prefer candidates that contain at least one "core" word.
         cur.execute(
             """
-            select
-                station_eva,
-                station_name,
-                similarity(station_name_search, %s) as score
+            select station_eva, station_name,
+                   similarity(station_name_search, %s) as score
             from dw.dim_station
             where station_name_search ~ %s
             order by station_name_search <-> %s
@@ -196,13 +191,10 @@ def resolve_station_eva(
             (score_query, core_pat, score_query),
         )
     else:
-        # generic-only query like "hauptbahnhof", "bahnhof", etc.
         cur.execute(
             """
-            select
-                station_eva,
-                station_name,
-                similarity(station_name_search, %s) as score
+            select station_eva, station_name,
+                   similarity(station_name_search, %s) as score
             from dw.dim_station
             order by station_name_search <-> %s
             limit 1
@@ -228,25 +220,23 @@ def resolve_station_eva(
         and best_eva is not None
     )
 
-    # Always log the attempt (log the FULL normalized string + core string + used score query)
+    # Always log the attempt (log BOTH raw + full search + score query)
     cur.execute(
         """
         insert into dw.station_resolve_log (
-            snapshot_key, source_path, station_raw,
-            station_search,
+            snapshot_key, source_path, station_raw, station_search,
             best_station_eva, best_station_name, best_score, auto_linked
         )
         values (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (snapshot_key, source_path, station_raw, station_search, best_eva, best_name, best_score, auto_linked),
+        (snapshot_key, source_path, station_raw, station_search_full, best_eva, best_name, best_score, auto_linked),
     )
 
     if auto_linked:
         if cache is not None:
-            cache[station_search] = best_eva
+            cache[cache_key] = best_eva
         return best_eva
 
-    # Borderline/failed -> needs_review (de-dup by station_search)
     cur.execute(
         """
         insert into dw.needs_review (
@@ -264,11 +254,11 @@ def resolve_station_eva(
             last_source_path = excluded.last_source_path,
             last_seen_at = now()
         """,
-        (station_search, station_raw, best_eva, best_name, best_score, snapshot_key, source_path),
+        (cache_key, station_raw, best_eva, best_name, best_score, snapshot_key, source_path),
     )
 
     if cache is not None:
-        cache[station_search] = None
+        cache[cache_key] = None
     return None
 
 
@@ -281,9 +271,6 @@ def get_station_eva_for_timetable(
     threshold: float,
     cache: Dict[str, Optional[int]],
 ) -> Optional[int]:
-    """
-    Prefer numeric EVA on root if present; else resolve station name via pg_trgm.
-    """
     eva_attr = root.get("eva")
     if eva_attr:
         try:
@@ -302,7 +289,6 @@ def get_station_eva_for_timetable(
             cache=cache,
         )
 
-    # Fallback: filename-derived
     station_guess = station_name_from_timetable_filename(os.path.basename(xml_path))
     return resolve_station_eva(
         cur,
@@ -314,24 +300,35 @@ def get_station_eva_for_timetable(
     )
 
 
-# ---------- fact ingestion ----------
+# ---------- snapshot discovery ----------
 
-def upsert_fact_movement_from_timetables(
+def iter_timetable_snapshots(timetables_root: str = "timetables") -> Iterator[str]:
+    """
+    Finds snapshot folders under timetables/**/<snapshot_key>/
+    Example: timetables/2509/250902/2509021400/*.xml (your structure may vary)
+    """
+    for p in glob.glob(os.path.join(timetables_root, "**", "[0-9]" * 10), recursive=True):
+        if os.path.isdir(p):
+            key = os.path.basename(p)
+            if _SNAPSHOT_KEY_RE.match(key):
+                yield key
+
+
+def timetables_glob_for_snapshot(snapshot_key: str, timetables_root: str = "timetables") -> str:
+    return os.path.join(timetables_root, "**", snapshot_key, "*.xml")
+
+
+# ---------- fact ingestion (ONE snapshot) ----------
+
+def upsert_fact_movement_for_snapshot(
     cur,
     snapshot_key: str,
-    timetables_glob: str,
     *,
     threshold: float,
+    timetables_root: str = "timetables",
     page_size: int = 5000,
 ) -> int:
-    """
-    Planned ingestion for ONE snapshot_key.
-
-    IMPORTANT: Pass timetables_glob that only points to that snapshot folder, e.g.
-      timetables/**/2509021400/*.xml
-    """
-    if not _SNAPSHOT_KEY_RE.match(snapshot_key):
-        raise ValueError(f"Invalid snapshot_key (expected YYMMDDHHmm): {snapshot_key}")
+    timetables_glob = timetables_glob_for_snapshot(snapshot_key, timetables_root=timetables_root)
 
     train_map = load_train_map(cur)
     station_cache: Dict[str, Optional[int]] = {}
@@ -369,6 +366,10 @@ def upsert_fact_movement_from_timetables(
             if not cat or not num:
                 continue
 
+            # FILTER: skip buses entirely
+            if cat.lower() == "bus":
+                continue
+
             train_id = train_map.get((cat, num))
             if train_id is None:
                 cur.execute(
@@ -397,6 +398,7 @@ def upsert_fact_movement_from_timetables(
             ar_hidden = (ar is not None and ar.get("hi") == "1")
             dp_hidden = (dp is not None and dp.get("hi") == "1")
 
+            # If both hidden, it is not a passenger-relevant stop
             if ar_hidden and dp_hidden:
                 continue
 
@@ -412,7 +414,6 @@ def upsert_fact_movement_from_timetables(
                 dp_ts = parse_yyMMddHHmm(dp.get("pt"))
                 dp_pp = dp.get("pp") or None
 
-            # NEW: derive prev/next station names from (c)pth and resolve to EVA
             prev_raw, next_raw = get_prev_next_station_raw(
                 ar=ar, dp=dp, ar_hidden=ar_hidden, dp_hidden=dp_hidden
             )
@@ -438,6 +439,12 @@ def upsert_fact_movement_from_timetables(
                     threshold=threshold,
                     cache=station_cache,
                 )
+            
+            # Prevent self-loops
+            if previous_station_eva == station_eva:
+                previous_station_eva = None
+            if next_station_eva == station_eva:
+                next_station_eva = None
 
             rows.append(
                 (
@@ -506,13 +513,44 @@ def upsert_fact_movement_from_timetables(
                 prev_eva,
                 next_eva,
             )
-            for (
-                sk, eva, tid, sid,
-                ar_ts, dp_ts, ar_plat, dp_plat,
-                ar_hidden, dp_hidden, prev_eva, next_eva
-            ) in rows
+            for (sk, eva, tid, sid, ar_ts, dp_ts, ar_plat, dp_plat, ar_hidden, dp_hidden, prev_eva, next_eva) in rows
         ],
         page_size=page_size,
     )
 
     return len(rows)
+
+
+# ---------- fact ingestion (ALL snapshots) ----------
+
+def upsert_fact_movement_from_all_timetables(
+    cur,
+    *,
+    timetables_root: str = "timetables",
+    threshold: float,
+    page_size: int = 5000,
+    commit_every: int = 1,
+) -> Dict[str, int]:
+    """
+    Walk all snapshot folders under timetables_root and ingest each.
+    Returns dict snapshot_key -> inserted_row_count.
+    """
+    # distinct + sorted for stable progress output
+    snapshot_keys = sorted(set(iter_timetable_snapshots(timetables_root)))
+
+    results: Dict[str, int] = {}
+    for i, sk in enumerate(snapshot_keys, start=1):
+        n = upsert_fact_movement_for_snapshot(
+            cur,
+            sk,
+            threshold=threshold,
+            timetables_root=timetables_root,
+            page_size=page_size,
+        )
+        results[sk] = n
+
+        # optional: you can commit outside this function; but if you want chunk commits:
+        if commit_every > 0 and hasattr(cur, "connection") and (i % commit_every == 0):
+            cur.connection.commit()
+
+    return results

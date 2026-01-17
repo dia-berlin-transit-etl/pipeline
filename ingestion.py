@@ -9,7 +9,7 @@ from typing import List
 from etl.stations import upsert_dim_station_from_json, print_dim_station_preview
 from etl.trains import upsert_dim_train_from_timetables
 from etl.time_dim import upsert_dim_time_from_paths, print_dim_time_preview
-from etl.fact_planned import upsert_fact_movement_from_timetables
+from etl.fact_planned import upsert_fact_movement_for_snapshot, upsert_fact_movement_from_all_timetables
 
 import psycopg2
 
@@ -33,11 +33,6 @@ def main() -> None:
         help="Which ingestion step to run.",
     )
 
-    # planned step args
-    ap.add_argument(
-        "--snapshot",
-        help="Snapshot key YYMMDDHHmm (e.g. 2509021400). Required for --step planned.",
-    )
     ap.add_argument(
         "--threshold",
         type=float,
@@ -88,42 +83,47 @@ def main() -> None:
                 print_dim_time_preview(cur, limit=30)
             
             elif args.step == "planned":
-                if not args.snapshot or not _SNAPSHOT_KEY_RE.match(args.snapshot):
-                    raise SystemExit("For --step planned you must pass --snapshot YYMMDDHHmm (e.g. 2509021400).")
+                # Run planned ingestion for ALL snapshots under timetables/**/<snapshot_key>/*.xml
+                # No --snapshot required anymore.
 
-                snapshot_key = args.snapshot
+                # You can still keep args.threshold as before
+                threshold = args.threshold
 
-                # IMPORTANT: only load XMLs for THIS snapshot folder
-                # Layout you described: timetables/week/hour/station_timetable.xml
-                # so hour folder name == snapshot_key
-                timetables_glob = os.path.join("timetables", "**", snapshot_key, "*.xml")
+                # Optional: commit every N snapshots (1 = safest, higher = faster)
+                commit_every = 10
 
-                n = upsert_fact_movement_from_timetables(
+                results = upsert_fact_movement_from_all_timetables(
                     cur,
-                    snapshot_key=snapshot_key,
-                    timetables_glob=timetables_glob,
-                    threshold=args.threshold,
+                    timetables_root="timetables",
+                    threshold=threshold,
+                    page_size=5000,
+                    commit_every=commit_every,
                 )
                 conn.commit()
 
                 # quick feedback
-                cur.execute("select count(*) from dw.fact_movement where snapshot_key=%s;", (snapshot_key,))
-                cnt = cur.fetchone()[0]
+                cur.execute("select count(*) from dw.fact_movement;")
+                total_fact = cur.fetchone()[0]
 
                 cur.execute("select count(*) from dw.needs_review;")
                 review_cnt = cur.fetchone()[0]
 
-                cur.execute(
-                    "select auto_linked, count(*) from dw.station_resolve_log where snapshot_key=%s group by auto_linked;",
-                    (snapshot_key,),
-                )
-                rows = cur.fetchall()
-
-                print(f"planned ingestion done for snapshot={snapshot_key}")
-                print(f"prepared rows: {n}")
-                print(f"fact rows now for snapshot: {cnt}")
+                # show how many rows were ingested per snapshot (top 10)
+                top = sorted(results.items(), key=lambda kv: kv[0])[:10]
+                print(f"planned ingestion done for ALL snapshots (threshold={threshold})")
+                print(f"snapshots processed: {len(results)}")
+                print(f"total prepared rows (sum): {sum(results.values())}")
+                print(f"total fact_movement rows now: {total_fact}")
                 print(f"needs_review total rows: {review_cnt}")
-                print("resolve log breakdown (this snapshot):", rows)
+                print("first 10 snapshot counts:", top)
+
+                # optional: breakdown of auto_linked vs not (overall)
+                cur.execute(
+                    "select auto_linked, count(*) from dw.station_resolve_log group by auto_linked order by auto_linked;"
+                )
+                print("resolve log breakdown (overall):", cur.fetchall())
+
+
 
     except Exception:
         conn.rollback()
