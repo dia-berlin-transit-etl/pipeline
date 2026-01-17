@@ -12,7 +12,22 @@ def to_station_search_name(name: str) -> str:
     Search helper string used for pg_trgm / fuzzystrmatch lookups.
     """
     s = (name or "").strip().lower()
+    s = s.replace("ß", "ss")
+
+    # hbf (word + suffix)
+    s = re.sub(r"\bhbf\b\.?", " hauptbahnhof ", s)
+    s = re.sub(r"(?<=\w)hbf\b\.?", "hauptbahnhof", s)
+
+    # bf (word + suffix) — suffix excludes "...hbf"
+    s = re.sub(r"\bbf\b\.?", " bahnhof ", s)
+    s = re.sub(r"(?<=\w)(?<!h)bf\b\.?", "bahnhof", s)
+
+    # str (word + suffix)
+    s = re.sub(r"\bstr\b\.?", " strasse ", s)
+    s = re.sub(r"(?<=\w)str\b\.?", "strasse", s)
+
     s = re.sub(r"\bberlin\b", " ", s)
+
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
