@@ -19,6 +19,7 @@ GENERIC = {
     "bahn",
 }
 
+
 def _split_path_list(path_str: Optional[str]) -> List[str]:
     """
     Split ppth/cpth field: "A|B|C" -> ["A","B","C"]
@@ -85,7 +86,6 @@ def parse_yyMMddHHmm(ts: Optional[str]) -> Optional[datetime]:
     return datetime(2000 + yy, mm, dd, hh, mi)
 
 
-
 def _core_token_regex(station_search: str) -> Optional[str]:
     toks = [t for t in station_search.split() if len(t) >= 2 and t not in GENERIC]
     if not toks:
@@ -93,6 +93,15 @@ def _core_token_regex(station_search: str) -> Optional[str]:
     # whole-word match for any core token
     # e.g. \m(gesundbrunnen|leipzig)\M
     return r"\m(" + "|".join(re.escape(t) for t in toks) + r")\M"
+
+
+def _core_search_string(station_search: str) -> str:
+    """
+    Remove GENERIC tokens (and 1-char junk) from a normalized station_search string.
+    Used for scoring so that qualifiers like 's bahn' don't drag the similarity down.
+    """
+    toks = [t for t in station_search.split() if len(t) >= 2 and t not in GENERIC]
+    return " ".join(toks).strip()
 
 
 def to_station_search_name(name: str) -> str:
@@ -146,6 +155,12 @@ def resolve_station_eva(
 ) -> Optional[int]:
     """
     Uses pg_trgm similarity on dim_station.station_name_search.
+
+    PRINCIPLED CHANGE:
+      - Candidate gating uses regex over CORE TOKENS (non-generic)
+      - Scoring uses similarity() against CORE-ONLY string,
+        so extra qualifiers (e.g. '(S-Bahn)') don't lower the score.
+
     Logs top candidate + score ALWAYS (station_resolve_log).
     Auto-links only if score >= threshold; else upserts into needs_review.
     """
@@ -158,33 +173,43 @@ def resolve_station_eva(
         return cache[station_search]
 
     core_pat = _core_token_regex(station_search)
+    core_search = _core_search_string(station_search)
+
     has_core = bool(core_pat)  # at least one non-generic token exists
+    # If it’s generic-only, we still allow candidate search, but we DO NOT auto-link.
+    score_query = core_search if core_search else station_search
 
     # Find best candidate by trigram distance, compute similarity score
     if core_pat:
+        # Prefer candidates that contain at least one "core" word.
         cur.execute(
             """
-            select station_eva, station_name,
+            select
+                station_eva,
+                station_name,
                 similarity(station_name_search, %s) as score
             from dw.dim_station
             where station_name_search ~ %s
             order by station_name_search <-> %s
             limit 1
             """,
-            (station_search, core_pat, station_search),
+            (score_query, core_pat, score_query),
         )
     else:
-        # generic-only query like "hauptbahnhof", "bahnhof", "s bahn", etc.
+        # generic-only query like "hauptbahnhof", "bahnhof", etc.
         cur.execute(
             """
-            select station_eva, station_name,
+            select
+                station_eva,
+                station_name,
                 similarity(station_name_search, %s) as score
             from dw.dim_station
             order by station_name_search <-> %s
             limit 1
             """,
-            (station_search, station_search),
+            (score_query, score_query),
         )
+
     row = cur.fetchone()
 
     best_eva: Optional[int] = None
@@ -203,11 +228,12 @@ def resolve_station_eva(
         and best_eva is not None
     )
 
-    # Always log the attempt
+    # Always log the attempt (log the FULL normalized string + core string + used score query)
     cur.execute(
         """
         insert into dw.station_resolve_log (
-            snapshot_key, source_path, station_raw, station_search,
+            snapshot_key, source_path, station_raw,
+            station_search,
             best_station_eva, best_station_name, best_score, auto_linked
         )
         values (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -220,7 +246,7 @@ def resolve_station_eva(
             cache[station_search] = best_eva
         return best_eva
 
-    # Borderline/failed -> needs_review (de-dupe by station_search)
+    # Borderline/failed -> needs_review (de-dup by station_search)
     cur.execute(
         """
         insert into dw.needs_review (
@@ -480,7 +506,11 @@ def upsert_fact_movement_from_timetables(
                 prev_eva,
                 next_eva,
             )
-            for (sk, eva, tid, sid, ar_ts, dp_ts, ar_plat, dp_plat, ar_hidden, dp_hidden, prev_eva, next_eva) in rows
+            for (
+                sk, eva, tid, sid,
+                ar_ts, dp_ts, ar_plat, dp_plat,
+                ar_hidden, dp_hidden, prev_eva, next_eva
+            ) in rows
         ],
         page_size=page_size,
     )
