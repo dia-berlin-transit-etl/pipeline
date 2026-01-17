@@ -71,8 +71,12 @@ create table if not exists dw.fact_movement (
 
     arrival_delay_min integer,
     departure_delay_min integer,
+
+    previous_station_eva bigint,
+    next_station_eva bigint,
     
-    is_hidden boolean not null default false,
+    arrival_is_hidden boolean not null default false,
+    departure_is_hidden boolean not null default false,
 
     unique (snapshot_key, station_eva, stop_id),
 
@@ -83,7 +87,13 @@ create table if not exists dw.fact_movement (
         foreign key (station_eva) references dw.dim_station(station_eva),
 
     constraint fk_fact_train
-        foreign key (train_id) references dw.dim_train(train_id)
+        foreign key (train_id) references dw.dim_train(train_id),
+    
+    constraint fk_fact_prev_station
+        foreign key (previous_station_eva) references dw.dim_station(station_eva),
+
+    constraint fk_fact_next_station
+        foreign key (next_station_eva) references dw.dim_station(station_eva)
 );
 
 -- index for fuzzy matching (requires pg_trgm extension)
