@@ -12,7 +12,16 @@ def to_station_search_name(name: str) -> str:
     Search helper string used for pg_trgm / fuzzystrmatch lookups.
     """
     s = (name or "").strip().lower()
-    s = s.replace("ß", "ss")
+
+    # German folding (more robust for fuzzy matching / filenames)
+    s = (s.replace("ß", "s") # not ss but s
+           .replace("ä", "a")
+           .replace("ö", "o")
+           .replace("ü", "u"))
+
+    # If filenames use '_' as a placeholder inside words (e.g. s_d for süd),
+    # don't turn it into a space — remove it when it's between word chars.
+    s = re.sub(r"(?<=\w)_(?=\w)", "", s)
 
     # hbf (word + suffix)
     s = re.sub(r"\bhbf\b\.?", " hauptbahnhof ", s)
@@ -23,11 +32,13 @@ def to_station_search_name(name: str) -> str:
     s = re.sub(r"(?<=\w)(?<!h)bf\b\.?", "bahnhof", s)
 
     # str (word + suffix)
-    s = re.sub(r"\bstr\b\.?", " strasse ", s)
-    s = re.sub(r"(?<=\w)str\b\.?", "strasse", s)
+    s = re.sub(r"\bstr\b\.?", " strase ", s)
+    s = re.sub(r"(?<=\w)str\b\.?", "strase", s)
+    s = re.sub(r"\b(\w+)\s+strase\b", r"\1strase", s)
 
     s = re.sub(r"\bberlin\b", " ", s)
 
+    # Keep underscore already handled; now strip everything else to spaces
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s

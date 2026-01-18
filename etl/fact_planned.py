@@ -1,4 +1,3 @@
-# fact_planned.py (updated to ingest ALL snapshots under timetables/)
 from __future__ import annotations
 
 import glob
@@ -114,7 +113,16 @@ def to_station_search_name(name: str) -> str:
     Must match how you populate dim_station.station_name_search.
     """
     s = (name or "").strip().lower()
-    s = s.replace("ß", "ss")
+
+    # German folding (more robust for fuzzy matching / filenames)
+    s = (s.replace("ß", "s") # not ss but s
+           .replace("ä", "a")
+           .replace("ö", "o")
+           .replace("ü", "u"))
+
+    # If filenames use '_' as a placeholder inside words (e.g. s_d for süd),
+    # don't turn it into a space — remove it when it's between word chars.
+    s = re.sub(r"(?<=\w)_(?=\w)", "", s)
 
     # hbf (word + suffix)
     s = re.sub(r"\bhbf\b\.?", " hauptbahnhof ", s)
@@ -125,11 +133,13 @@ def to_station_search_name(name: str) -> str:
     s = re.sub(r"(?<=\w)(?<!h)bf\b\.?", "bahnhof", s)
 
     # str (word + suffix)
-    s = re.sub(r"\bstr\b\.?", " strasse ", s)
-    s = re.sub(r"(?<=\w)str\b\.?", "strasse", s)
+    s = re.sub(r"\bstr\b\.?", " strase ", s)
+    s = re.sub(r"(?<=\w)str\b\.?", "strase", s)
+    s = re.sub(r"\b(\w+)\s+strase\b", r"\1strase", s)
 
     s = re.sub(r"\bberlin\b", " ", s)
 
+    # Keep underscore already handled; now strip everything else to spaces
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -137,13 +147,16 @@ def to_station_search_name(name: str) -> str:
 
 def station_name_from_timetable_filename(xml_path: str) -> str:
     """
-    e.g. berlin_ostbahnhof_timetable.xml -> "berlin ostbahnhof"
+    Extract a station-ish string from a timetable filename.
+    IMPORTANT: do NOT blindly replace '_' with spaces, because '_' may be used
+    inside words as an umlaut placeholder (e.g. s_d for süd).
     """
     stem = Path(xml_path).stem.lower().strip()
     stem = re.sub(r"(?:_timetable|_timetables)$", "", stem)
-    stem = stem.replace("_", " ")
-    stem = re.sub(r"[^a-z0-9\s]", " ", stem)
-    stem = re.sub(r"\s+", " ", stem).strip()
+
+    # Keep underscores for now; just strip weird chars (keep _ so to_station_search_name can handle it)
+    #stem = re.sub(r"[^a-z0-9_\s]", " ", stem)
+    #stem = re.sub(r"\s+", " ", stem).strip()
     return stem
 
 
@@ -214,10 +227,12 @@ def resolve_station_eva(
         best_score = float(row[2]) if row[2] is not None else None
 
     auto_linked = bool(
-        has_core
-        and best_score is not None
-        and best_score >= threshold
+        best_score is not None
         and best_eva is not None
+        and (
+            (has_core and best_score >= threshold)
+            or ((not has_core) and best_score >= 0.72)
+        )
     )
 
     # Always log the attempt (log BOTH raw + full search + score query)
@@ -289,7 +304,9 @@ def get_station_eva_for_timetable(
             cache=cache,
         )
 
-    station_guess = station_name_from_timetable_filename(os.path.basename(xml_path))
+    station_guess_raw = station_name_from_timetable_filename(os.path.basename(xml_path))
+    # normalize using the SAME function used everywhere else
+    station_guess = to_station_search_name(station_guess_raw)
     return resolve_station_eva(
         cur,
         station_raw=station_guess,
@@ -340,6 +357,11 @@ def upsert_fact_movement_for_snapshot(
             root = ET.parse(path).getroot()
         except ET.ParseError:
             continue
+        
+        # NEW: skip empty timetable files (no <s> stop tags)
+        stops = root.findall("./s")
+        if not stops:
+            continue
 
         station_eva = get_station_eva_for_timetable(
             cur,
@@ -352,7 +374,7 @@ def upsert_fact_movement_for_snapshot(
         if station_eva is None:
             continue
 
-        for s in root.findall("./s"):
+        for s in stops:
             stop_id = s.get("id")
             if not stop_id:
                 continue
