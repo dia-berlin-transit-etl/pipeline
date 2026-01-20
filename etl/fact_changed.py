@@ -99,6 +99,52 @@ def station_name_from_timetable_filename(xml_path: str) -> str:
 
 
 # ----------------------------
+# dim_train helpers
+# ----------------------------
+
+def load_train_map(cur) -> Dict[Tuple[str, str], int]:
+    cur.execute("select train_id, category, train_number from dw.dim_train;")
+    return {(c, n): int(tid) for (tid, c, n) in cur.fetchall()}
+
+
+def get_or_create_train_id(cur, train_map: Dict[Tuple[str, str], int], *, category: str, number: str) -> Optional[int]:
+    cat = (category or "").strip()
+    num = (number or "").strip()
+    if not cat or not num:
+        return None
+
+    # optional: skip buses entirely
+    if cat.lower() == "bus":
+        return None
+
+    key = (cat, num)
+    tid = train_map.get(key)
+    if tid is not None:
+        return tid
+
+    cur.execute(
+        """
+        insert into dw.dim_train (category, train_number)
+        values (%s, %s)
+        on conflict (category, train_number) do nothing
+        returning train_id
+        """,
+        (cat, num),
+    )
+    got = cur.fetchone()
+    if got:
+        tid = int(got[0])
+    else:
+        cur.execute("select train_id from dw.dim_train where category=%s and train_number=%s", (cat, num))
+        row = cur.fetchone()
+        tid = int(row[0]) if row else None
+
+    if tid is not None:
+        train_map[key] = tid
+    return tid
+
+
+# ----------------------------
 # Station resolve (pg_trgm)
 # ----------------------------
 
@@ -297,7 +343,7 @@ def _cancel_update_from_cs(el: Optional[ET.Element]) -> Optional[bool]:
     """
     Returns:
       True  -> explicitly cancelled now (cs='c')
-      False -> explicitly not cancelled now (cs='p' or cs='a')  [revoked/planned/added]
+      False -> explicitly not cancelled now (cs='p' or cs='a')  [revoked / planned / added]
       None  -> no information (cs absent/unknown) -> carry forward from base row
     """
     if el is None:
@@ -312,11 +358,49 @@ def _cancel_update_from_cs(el: Optional[ET.Element]) -> Optional[bool]:
         return False
     return None
 
+def _is_added_by_ps_or_cs(el: Optional[ET.Element]) -> bool:
+    """
+    Added stops can show up as ps="a" (your observed case) and sometimes also cs="a".
+    """
+    if el is None:
+        return False
+    ps = (el.get("ps") or "").strip().lower()
+    if ps == "a":
+        return True
+    cs = (el.get("cs") or "").strip().lower()
+    return cs == "a"
+
+
+def _stop_id_suffix_int(stop_id: str) -> Optional[int]:
+    """
+    stop_id often looks like "...-YYMMDDHHmm-<idx>" where idx can be >= 100 for added stops.
+    """
+    try:
+        last = stop_id.rsplit("-", 1)[-1]
+        return int(last)
+    except Exception:
+        return None
+
 
 def _parse_changed_time(el: Optional[ET.Element]) -> Optional[datetime]:
     if el is None:
         return None
     return parse_yyMMddHHmm(el.get("ct"))
+
+
+def _parse_planned_time(el: Optional[ET.Element]) -> Optional[datetime]:
+    """
+    In changes feed, pt can appear (often for added stops).
+    """
+    if el is None:
+        return None
+    return parse_yyMMddHHmm(el.get("pt"))
+
+
+def _is_hidden(el: Optional[ET.Element]) -> bool:
+    if el is None:
+        return False
+    return (el.get("hi") or "").strip() == "1"
 
 
 def _split_path_list(path_str: Optional[str]) -> List[str]:
@@ -326,22 +410,28 @@ def _split_path_list(path_str: Optional[str]) -> List[str]:
     return [p for p in parts if p]
 
 
-def _prev_next_from_changed_path(
+def _prev_next_from_any_path(
     *,
     ar: Optional[ET.Element],
     dp: Optional[ET.Element],
 ) -> Tuple[Optional[str], Optional[str]]:
+    """
+    For changes files you may have both cpth and ppth (especially on added stops).
+    Use cpth if present, else ppth.
+    - prev from arrival: last station in (c)pth
+    - next from departure: first station in (c)pth
+    """
     prev_raw: Optional[str] = None
     next_raw: Optional[str] = None
 
     if ar is not None:
-        ar_path = ar.get("cpth")
+        ar_path = ar.get("cpth") or ar.get("ppth")
         ar_list = _split_path_list(ar_path)
         if ar_list:
             prev_raw = ar_list[-1]
 
     if dp is not None:
-        dp_path = dp.get("cpth")
+        dp_path = dp.get("cpth") or dp.get("ppth")
         dp_list = _split_path_list(dp_path)
         if dp_list:
             next_raw = dp_list[0]
@@ -369,22 +459,22 @@ def upsert_fact_movement_from_changes_snapshot(
     page_size: int = 5000,
 ) -> int:
     """
-    For each changes snapshot_key S:
-    - parse change XMLs under timetable_changes/**/S/*.xml
-    - derive (station_eva, stop_id)
-    - find latest base row in dw.fact_movement for that key with snapshot_key <= S
-      (so changes chain on top of earlier changes if they exist)
-    - upsert into dw.fact_movement at (S, station_eva, stop_id)
-
-    Cancellation semantics:
-    - cs='c' => cancelled=True
-    - cs in ('p','a') => cancelled=False (revoked / planned / added)
-    - cs absent => carry forward base cancelled state
+    Adds support for "added stops" that exist only in timetable_changes:
+    - Detect as added if any of:
+        * ar/dp has ps="a"
+        * ar/dp has cs="a"
+        * stop_id suffix idx >= 100
+    - If no base row exists in dw.fact_movement for (station_eva, stop_id) with snapshot_key <= S:
+        * insert a new row using pt for planned_* (if present),
+          ct for changed_* (if present),
+          tl for train_id,
+          (c)pth for prev/next.
     """
     ensure_dim_time(cur, snapshot_key)
 
     changes_glob = changes_glob_for_snapshot(snapshot_key, timetable_changes_root=timetable_changes_root)
     station_cache: Dict[str, Optional[int]] = {}
+    train_map = load_train_map(cur)
 
     # (station_eva, stop_id) -> changed info (last wins within same snapshot)
     change_map: Dict[Tuple[int, str], Dict[str, object]] = {}
@@ -418,17 +508,40 @@ def upsert_fact_movement_from_changes_snapshot(
             ar = s.find("ar")
             dp = s.find("dp")
 
+            # --- detect added stop (ps="a" or cs="a" or stop_id suffix >= 100)
+            idx = _stop_id_suffix_int(stop_id)
+            is_added = (
+                _is_added_by_ps_or_cs(ar)
+                or _is_added_by_ps_or_cs(dp)
+                or (idx is not None and idx >= 100)
+            )
+
+            # --- train id (needed for added stops with no base; also fine for normal changes)
+            tl = s.find("tl")
+            cat = (tl.get("c") or "").strip() if tl is not None else ""
+            num = (tl.get("n") or "").strip() if tl is not None else ""
+            train_id = get_or_create_train_id(cur, train_map, category=cat, number=num)
+
+            # --- cancel updates from cs (carry-forward logic is applied later)
             ar_cancel_update = _cancel_update_from_cs(ar)
             dp_cancel_update = _cancel_update_from_cs(dp)
 
+            # --- times
             ar_ct = _parse_changed_time(ar)
             dp_ct = _parse_changed_time(dp)
 
-            prev_raw, next_raw = _prev_next_from_changed_path(ar=ar, dp=dp)
+            ar_pt = _parse_planned_time(ar)
+            dp_pt = _parse_planned_time(dp)
+
+            # --- hidden flags
+            ar_hidden = _is_hidden(ar)
+            dp_hidden = _is_hidden(dp)
+
+            # --- path (use cpth else ppth)
+            prev_raw, next_raw = _prev_next_from_any_path(ar=ar, dp=dp)
 
             changed_prev_eva: Optional[int] = None
             changed_next_eva: Optional[int] = None
-
             if prev_raw:
                 changed_prev_eva = resolve_station_eva(
                     cur,
@@ -448,25 +561,38 @@ def upsert_fact_movement_from_changes_snapshot(
                     cache=station_cache,
                 )
 
-            has_cancel_signal = (ar_cancel_update is not None) or (dp_cancel_update is not None)
-
-            # Keep only meaningful changes
-            if not (ar_ct or dp_ct or has_cancel_signal or changed_prev_eva or changed_next_eva):
-                continue
-
             # prevent self-loops
             if changed_prev_eva == station_eva:
                 changed_prev_eva = None
             if changed_next_eva == station_eva:
                 changed_next_eva = None
 
+            has_cancel_signal = (ar_cancel_update is not None) or (dp_cancel_update is not None)
+
+            # Keep only meaningful changes OR added stops (because added stops may only have pt/ct/ppth/cpth)
+            has_any_time_signal = bool(ar_ct or dp_ct or ar_pt or dp_pt)
+            has_any_path_signal = bool(changed_prev_eva or changed_next_eva)
+            if not (has_any_time_signal or has_cancel_signal or has_any_path_signal or is_added):
+                continue
+
             change_map[(station_eva, stop_id)] = {
+                "is_added": is_added,
+                "train_id": train_id,
+
+                "planned_arrival_ts_from_pt": ar_pt,
+                "planned_departure_ts_from_pt": dp_pt,
+
                 "changed_arrival_ts": ar_ct,
                 "changed_departure_ts": dp_ct,
+
                 "arrival_cancel_update": ar_cancel_update,
                 "departure_cancel_update": dp_cancel_update,
+
                 "changed_previous_station_eva": changed_prev_eva,
                 "changed_next_station_eva": changed_next_eva,
+
+                "arrival_is_hidden": ar_hidden,
+                "departure_is_hidden": dp_hidden,
             }
 
     if not change_map:
@@ -474,7 +600,7 @@ def upsert_fact_movement_from_changes_snapshot(
 
     wanted_list = list(change_map.keys())
 
-    # Fetch latest base row <= snapshot_key for each key
+    # Fetch latest base row <= snapshot_key for each key (including those created by earlier changes snapshots)
     cur.execute(
         """
         with wanted(station_eva, stop_id) as (
@@ -518,32 +644,109 @@ def upsert_fact_movement_from_changes_snapshot(
     out_rows: List[Tuple] = []
     for key, ch in change_map.items():
         base = base_map.get(key)
-        if base is None:
-            # No base planned/as-of row exists for this key
-            continue
 
-        (
-            station_eva,
-            stop_id,
-            train_id,
-            planned_ar_ts,
-            planned_dp_ts,
-            base_prev_eva,
-            base_next_eva,
-            ar_hidden,
-            dp_hidden,
-            base_ar_cancelled,
-            base_dp_cancelled,
-        ) = base
+        station_eva, stop_id = key
+        is_added = bool(ch.get("is_added"))
+        train_id_from_xml = ch.get("train_id")
+        pt_ar = ch.get("planned_arrival_ts_from_pt")
+        pt_dp = ch.get("planned_departure_ts_from_pt")
 
-        changed_ar_ts: Optional[datetime] = ch["changed_arrival_ts"]  # type: ignore[assignment]
-        changed_dp_ts: Optional[datetime] = ch["changed_departure_ts"]  # type: ignore[assignment]
+        changed_ar_ts: Optional[datetime] = ch.get("changed_arrival_ts")  # type: ignore[assignment]
+        changed_dp_ts: Optional[datetime] = ch.get("changed_departure_ts")  # type: ignore[assignment]
 
         ar_update = ch.get("arrival_cancel_update")   # Optional[bool]
         dp_update = ch.get("departure_cancel_update") # Optional[bool]
 
-        changed_prev_eva = ch.get("changed_previous_station_eva")  # type: ignore[assignment]
-        changed_next_eva = ch.get("changed_next_station_eva")      # type: ignore[assignment]
+        changed_prev_eva = ch.get("changed_previous_station_eva")
+        changed_next_eva = ch.get("changed_next_station_eva")
+
+        xml_ar_hidden = bool(ch.get("arrival_is_hidden"))
+        xml_dp_hidden = bool(ch.get("departure_is_hidden"))
+
+        if base is None:
+            # Only allowed if it's an "added stop" (or if you want to accept orphan changes; you said you want added).
+            if not is_added:
+                continue
+
+            # Build "base" from XML
+            train_id = int(train_id_from_xml) if train_id_from_xml is not None else None
+            if train_id is None:
+                # cannot insert without train_id (fact_movement.train_id is NOT NULL in your schema)
+                continue
+
+            planned_ar_ts = pt_ar if isinstance(pt_ar, datetime) else None
+            planned_dp_ts = pt_dp if isinstance(pt_dp, datetime) else None
+
+            base_prev_eva = None
+            base_next_eva = None
+
+            # For added stops, treat changed_prev/next as the base prev/next (it is the best we have)
+            if isinstance(changed_prev_eva, int):
+                base_prev_eva = changed_prev_eva
+            if isinstance(changed_next_eva, int):
+                base_next_eva = changed_next_eva
+
+            # If cs is absent on an added stop, default to not cancelled.
+            arrival_cancelled = False if ar_update is None else bool(ar_update)
+            departure_cancelled = False if dp_update is None else bool(dp_update)
+
+            arrival_delay_min = None
+            departure_delay_min = None
+            if (not arrival_cancelled) and (planned_ar_ts is not None) and (changed_ar_ts is not None):
+                arrival_delay_min = _delay_minutes(planned_ar_ts, changed_ar_ts)
+            if (not departure_cancelled) and (planned_dp_ts is not None) and (changed_dp_ts is not None):
+                departure_delay_min = _delay_minutes(planned_dp_ts, changed_dp_ts)
+
+            out_rows.append(
+                (
+                    snapshot_key,
+                    int(station_eva),
+                    int(train_id),
+                    str(stop_id),
+
+                    planned_ar_ts,
+                    planned_dp_ts,
+                    base_prev_eva,
+                    base_next_eva,
+
+                    changed_ar_ts,
+                    changed_dp_ts,
+                    changed_prev_eva if isinstance(changed_prev_eva, int) else None,
+                    changed_next_eva if isinstance(changed_next_eva, int) else None,
+
+                    arrival_cancelled,
+                    departure_cancelled,
+
+                    arrival_delay_min,
+                    departure_delay_min,
+
+                    bool(xml_ar_hidden),
+                    bool(xml_dp_hidden),
+                )
+            )
+            continue
+
+        # --- Normal path (base exists): chain changes on top of latest <= snapshot_key
+        (
+            _base_station_eva,
+            _base_stop_id,
+            base_train_id,
+            planned_ar_ts,
+            planned_dp_ts,
+            base_prev_eva,
+            base_next_eva,
+            base_ar_hidden,
+            base_dp_hidden,
+            base_ar_cancelled,
+            base_dp_cancelled,
+        ) = base
+
+        # For added stops that already exist from an earlier snapshot:
+        # if planned_* are missing and pt exists now, backfill (safe because planned_* are "planned context").
+        if planned_ar_ts is None and isinstance(pt_ar, datetime):
+            planned_ar_ts = pt_ar
+        if planned_dp_ts is None and isinstance(pt_dp, datetime):
+            planned_dp_ts = pt_dp
 
         # carry forward cancellation unless explicitly updated by cs
         arrival_cancelled = base_ar_cancelled if ar_update is None else bool(ar_update)
@@ -555,15 +758,19 @@ def upsert_fact_movement_from_changes_snapshot(
 
         if (not arrival_cancelled) and (changed_ar_ts is not None) and (planned_ar_ts is not None):
             arrival_delay_min = _delay_minutes(planned_ar_ts, changed_ar_ts)
-
+        
         if (not departure_cancelled) and (changed_dp_ts is not None) and (planned_dp_ts is not None):
             departure_delay_min = _delay_minutes(planned_dp_ts, changed_dp_ts)
+
+        # if we have hidden flags from XML, use them; else carry forward base flags
+        out_ar_hidden = bool(xml_ar_hidden) if (ar is not None or dp is not None) else bool(base_ar_hidden)
+        out_dp_hidden = bool(xml_dp_hidden) if (ar is not None or dp is not None) else bool(base_dp_hidden)
 
         out_rows.append(
             (
                 snapshot_key,
                 int(station_eva),
-                int(train_id),
+                int(base_train_id),
                 str(stop_id),
 
                 planned_ar_ts,
@@ -573,8 +780,8 @@ def upsert_fact_movement_from_changes_snapshot(
 
                 changed_ar_ts,
                 changed_dp_ts,
-                changed_prev_eva,
-                changed_next_eva,
+                changed_prev_eva if isinstance(changed_prev_eva, int) else None,
+                changed_next_eva if isinstance(changed_next_eva, int) else None,
 
                 arrival_cancelled,
                 departure_cancelled,
@@ -582,8 +789,8 @@ def upsert_fact_movement_from_changes_snapshot(
                 arrival_delay_min,
                 departure_delay_min,
 
-                bool(ar_hidden),
-                bool(dp_hidden),
+                bool(out_ar_hidden),
+                bool(out_dp_hidden),
             )
         )
 
