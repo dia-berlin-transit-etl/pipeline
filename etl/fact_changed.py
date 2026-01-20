@@ -1,4 +1,4 @@
-# fact_changed.py
+# etl/fact_changed.py
 from __future__ import annotations
 
 import glob
@@ -20,6 +20,10 @@ GENERIC = {
     "bahn",
 }
 
+
+# ----------------------------
+# Parsing helpers
+# ----------------------------
 
 def parse_yyMMddHHmm(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
@@ -51,28 +55,38 @@ def _core_search_string(station_search: str) -> str:
     return " ".join(toks)
 
 
+# ----------------------------
+# Station name normalization (MUST match dim_station.station_name_search)
+# ----------------------------
+
 def to_station_search_name(name: str) -> str:
     s = (name or "").strip().lower()
 
+    # German folding
     s = (s.replace("ß", "s")
            .replace("ä", "a")
            .replace("ö", "o")
            .replace("ü", "u"))
 
+    # underscore inside words (umlaut placeholder): s_d -> sd
     s = re.sub(r"(?<=\w)_(?=\w)", "", s)
 
+    # hbf / bf
     s = re.sub(r"\bhbf\b\.?", " hauptbahnhof ", s)
     s = re.sub(r"(?<=\w)hbf\b\.?", "hauptbahnhof", s)
 
     s = re.sub(r"\bbf\b\.?", " bahnhof ", s)
     s = re.sub(r"(?<=\w)(?<!h)bf\b\.?", "bahnhof", s)
 
+    # str -> strase and join "osdorfer strase" -> "osdorferstrase"
     s = re.sub(r"\bstr\b\.?", " strase ", s)
     s = re.sub(r"(?<=\w)str\b\.?", "strase", s)
     s = re.sub(r"\b(\w+)\s+strase\b", r"\1strase", s)
 
+    # drop berlin token
     s = re.sub(r"\bberlin\b", " ", s)
 
+    # strip everything else
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -83,6 +97,10 @@ def station_name_from_timetable_filename(xml_path: str) -> str:
     stem = re.sub(r"(?:_timetable|_timetables|_changes|_timetable_changes)$", "", stem)
     return stem
 
+
+# ----------------------------
+# Station resolve (pg_trgm)
+# ----------------------------
 
 def resolve_station_eva(
     cur,
@@ -150,6 +168,7 @@ def resolve_station_eva(
         )
     )
 
+    # always log the attempt
     cur.execute(
         """
         insert into dw.station_resolve_log (
@@ -166,6 +185,7 @@ def resolve_station_eva(
             cache[cache_key] = best_eva
         return best_eva
 
+    # borderline/failed => needs_review
     cur.execute(
         """
         insert into dw.needs_review (
@@ -218,6 +238,7 @@ def get_station_eva_for_changes_file(
             cache=cache,
         )
 
+    # fallback: filename-derived
     station_guess_raw = station_name_from_timetable_filename(os.path.basename(xml_path))
     station_guess = to_station_search_name(station_guess_raw)
     return resolve_station_eva(
@@ -230,6 +251,10 @@ def get_station_eva_for_changes_file(
     )
 
 
+# ----------------------------
+# Snapshot discovery (changes)
+# ----------------------------
+
 def iter_change_snapshots(timetable_changes_root: str = "timetable_changes") -> Iterator[str]:
     for p in glob.glob(os.path.join(timetable_changes_root, "**", "[0-9]" * 10), recursive=True):
         if os.path.isdir(p):
@@ -241,6 +266,10 @@ def iter_change_snapshots(timetable_changes_root: str = "timetable_changes") -> 
 def changes_glob_for_snapshot(snapshot_key: str, timetable_changes_root: str = "timetable_changes") -> str:
     return os.path.join(timetable_changes_root, "**", snapshot_key, "*.xml")
 
+
+# ----------------------------
+# dim_time upsert (needed for FK)
+# ----------------------------
 
 def ensure_dim_time(cur, snapshot_key: str) -> None:
     ts = parse_yyMMddHHmm(snapshot_key)
@@ -260,24 +289,28 @@ def ensure_dim_time(cur, snapshot_key: str) -> None:
     )
 
 
-def _parse_event_status(el: Optional[ET.Element]) -> Optional[str]:
+# ----------------------------
+# Changes parsing
+# ----------------------------
+
+def _cancel_update_from_cs(el: Optional[ET.Element]) -> Optional[bool]:
+    """
+    Returns:
+      True  -> explicitly cancelled now (cs='c')
+      False -> explicitly not cancelled now (cs='p' or cs='a')  [revoked/planned/added]
+      None  -> no information (cs absent/unknown) -> carry forward from base row
+    """
     if el is None:
         return None
     cs = el.get("cs")
     if not cs:
         return None
     cs = cs.strip().lower()
-    return cs if cs in ("p", "a", "c") else None
-
-
-def _is_cancelled(el: Optional[ET.Element]) -> bool:
-    if el is None:
-        return False
-    cs = _parse_event_status(el)
     if cs == "c":
         return True
-    clt = el.get("clt")
-    return bool(clt and clt.strip())
+    if cs in ("p", "a"):
+        return False
+    return None
 
 
 def _parse_changed_time(el: Optional[ET.Element]) -> Optional[datetime]:
@@ -323,6 +356,10 @@ def _delay_minutes(planned: Optional[datetime], changed: Optional[datetime]) -> 
     return int(round(delta.total_seconds() / 60.0))
 
 
+# ----------------------------
+# Core ingestion (ONE changes snapshot)
+# ----------------------------
+
 def upsert_fact_movement_from_changes_snapshot(
     cur,
     snapshot_key: str,
@@ -331,12 +368,25 @@ def upsert_fact_movement_from_changes_snapshot(
     timetable_changes_root: str = "timetable_changes",
     page_size: int = 5000,
 ) -> int:
+    """
+    For each changes snapshot_key S:
+    - parse change XMLs under timetable_changes/**/S/*.xml
+    - derive (station_eva, stop_id)
+    - find latest base row in dw.fact_movement for that key with snapshot_key <= S
+      (so changes chain on top of earlier changes if they exist)
+    - upsert into dw.fact_movement at (S, station_eva, stop_id)
+
+    Cancellation semantics:
+    - cs='c' => cancelled=True
+    - cs in ('p','a') => cancelled=False (revoked / planned / added)
+    - cs absent => carry forward base cancelled state
+    """
     ensure_dim_time(cur, snapshot_key)
 
     changes_glob = changes_glob_for_snapshot(snapshot_key, timetable_changes_root=timetable_changes_root)
     station_cache: Dict[str, Optional[int]] = {}
 
-    # (station_eva, stop_id) -> changed info (last wins within the snapshot)
+    # (station_eva, stop_id) -> changed info (last wins within same snapshot)
     change_map: Dict[Tuple[int, str], Dict[str, object]] = {}
 
     for path in glob.glob(changes_glob, recursive=True):
@@ -368,8 +418,8 @@ def upsert_fact_movement_from_changes_snapshot(
             ar = s.find("ar")
             dp = s.find("dp")
 
-            ar_cancelled = _is_cancelled(ar)
-            dp_cancelled = _is_cancelled(dp)
+            ar_cancel_update = _cancel_update_from_cs(ar)
+            dp_cancel_update = _cancel_update_from_cs(dp)
 
             ar_ct = _parse_changed_time(ar)
             dp_ct = _parse_changed_time(dp)
@@ -398,11 +448,13 @@ def upsert_fact_movement_from_changes_snapshot(
                     cache=station_cache,
                 )
 
-            # keep only real signals
-            if not (ar_ct or dp_ct or ar_cancelled or dp_cancelled or changed_prev_eva or changed_next_eva):
+            has_cancel_signal = (ar_cancel_update is not None) or (dp_cancel_update is not None)
+
+            # Keep only meaningful changes
+            if not (ar_ct or dp_ct or has_cancel_signal or changed_prev_eva or changed_next_eva):
                 continue
 
-            # prevent self-loops for changed path too
+            # prevent self-loops
             if changed_prev_eva == station_eva:
                 changed_prev_eva = None
             if changed_next_eva == station_eva:
@@ -411,8 +463,8 @@ def upsert_fact_movement_from_changes_snapshot(
             change_map[(station_eva, stop_id)] = {
                 "changed_arrival_ts": ar_ct,
                 "changed_departure_ts": dp_ct,
-                "arrival_cancelled": ar_cancelled,
-                "departure_cancelled": dp_cancelled,
+                "arrival_cancel_update": ar_cancel_update,
+                "departure_cancel_update": dp_cancel_update,
                 "changed_previous_station_eva": changed_prev_eva,
                 "changed_next_station_eva": changed_next_eva,
             }
@@ -422,7 +474,7 @@ def upsert_fact_movement_from_changes_snapshot(
 
     wanted_list = list(change_map.keys())
 
-    # fetch latest base row <= snapshot_key for each (station_eva, stop_id)
+    # Fetch latest base row <= snapshot_key for each key
     cur.execute(
         """
         with wanted(station_eva, stop_id) as (
@@ -434,7 +486,8 @@ def upsert_fact_movement_from_changes_snapshot(
                 fm.train_id,
                 fm.planned_arrival_ts, fm.planned_departure_ts,
                 fm.previous_station_eva, fm.next_station_eva,
-                fm.arrival_is_hidden, fm.departure_is_hidden
+                fm.arrival_is_hidden, fm.departure_is_hidden,
+                fm.arrival_cancelled, fm.departure_cancelled
             from wanted w
             join dw.fact_movement fm
               on fm.station_eva = w.station_eva
@@ -446,7 +499,8 @@ def upsert_fact_movement_from_changes_snapshot(
             station_eva, stop_id, train_id,
             planned_arrival_ts, planned_departure_ts,
             previous_station_eva, next_station_eva,
-            arrival_is_hidden, departure_is_hidden
+            arrival_is_hidden, departure_is_hidden,
+            arrival_cancelled, departure_cancelled
         from latest
         """,
         (
@@ -465,6 +519,7 @@ def upsert_fact_movement_from_changes_snapshot(
     for key, ch in change_map.items():
         base = base_map.get(key)
         if base is None:
+            # No base planned/as-of row exists for this key
             continue
 
         (
@@ -477,18 +532,32 @@ def upsert_fact_movement_from_changes_snapshot(
             base_next_eva,
             ar_hidden,
             dp_hidden,
+            base_ar_cancelled,
+            base_dp_cancelled,
         ) = base
 
         changed_ar_ts: Optional[datetime] = ch["changed_arrival_ts"]  # type: ignore[assignment]
         changed_dp_ts: Optional[datetime] = ch["changed_departure_ts"]  # type: ignore[assignment]
-        arrival_cancelled: bool = bool(ch["arrival_cancelled"])
-        departure_cancelled: bool = bool(ch["departure_cancelled"])
 
-        arrival_delay_min = None if arrival_cancelled else _delay_minutes(planned_ar_ts, changed_ar_ts)
-        departure_delay_min = None if departure_cancelled else _delay_minutes(planned_dp_ts, changed_dp_ts)
+        ar_update = ch.get("arrival_cancel_update")   # Optional[bool]
+        dp_update = ch.get("departure_cancel_update") # Optional[bool]
 
         changed_prev_eva = ch.get("changed_previous_station_eva")  # type: ignore[assignment]
         changed_next_eva = ch.get("changed_next_station_eva")      # type: ignore[assignment]
+
+        # carry forward cancellation unless explicitly updated by cs
+        arrival_cancelled = base_ar_cancelled if ar_update is None else bool(ar_update)
+        departure_cancelled = base_dp_cancelled if dp_update is None else bool(dp_update)
+
+        # delay minutes only if not cancelled and ct exists
+        arrival_delay_min = None
+        departure_delay_min = None
+
+        if (not arrival_cancelled) and (changed_ar_ts is not None) and (planned_ar_ts is not None):
+            arrival_delay_min = _delay_minutes(planned_ar_ts, changed_ar_ts)
+
+        if (not departure_cancelled) and (changed_dp_ts is not None) and (planned_dp_ts is not None):
+            departure_delay_min = _delay_minutes(planned_dp_ts, changed_dp_ts)
 
         out_rows.append(
             (
@@ -576,6 +645,10 @@ def upsert_fact_movement_from_changes_snapshot(
 
     return len(out_rows)
 
+
+# ----------------------------
+# Ingest ALL changes snapshots
+# ----------------------------
 
 def upsert_fact_movement_from_all_timetable_changes(
     cur,
