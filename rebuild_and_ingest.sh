@@ -26,5 +26,6 @@ python ingestion.py --step stations
 python ingestion.py --step trains
 python ingestion.py --step time
 python ingestion.py --step planned --threshold 0.52 # --snapshot 2509021400
+python ingestion.py --step changed --threshold 0.52 # --snapshot 2509021400
 
 echo "== Done =="

@@ -1,14 +1,14 @@
 create schema if not exists dw;
 
+
 create table if not exists dw.dim_station (
     station_eva bigint primary key,
     station_name text not null,
-    station_name_search text not null, -- NEW
+    station_name_search text not null,
     lon double precision not null,
     lat double precision not null
 );
 
--- keeps every resolution attempt (top candidate + score)
 create table if not exists dw.station_resolve_log (
     id bigserial primary key,
     snapshot_key text not null,
@@ -22,9 +22,8 @@ create table if not exists dw.station_resolve_log (
     created_at timestamp not null default now()
 );
 
--- only “borderline/failed” cases
 create table if not exists dw.needs_review (
-    station_search text primary key,     -- de-dupe by normalized/search string
+    station_search text primary key,
     station_raw text not null,
     best_station_eva bigint,
     best_station_name text,
@@ -42,12 +41,13 @@ create table if not exists dw.dim_train (
 );
 
 create table if not exists dw.dim_time (
-    snapshot_key text primary key,   -- e.g. '2509021400' from folder
-    snapshot_ts timestamp not null,  -- parsed timestamp
+    snapshot_key text primary key,   -- YYMMddHHmm from folder
+    snapshot_ts timestamp not null,
     snapshot_date date not null,
     hour int not null,
     minute int not null
 );
+
 
 create table if not exists dw.fact_movement (
     movement_key bigserial primary key,
@@ -55,26 +55,29 @@ create table if not exists dw.fact_movement (
     snapshot_key  text   not null,
     station_eva   bigint not null,
     train_id      bigint not null,
+    stop_id       text   not null,
 
-    stop_id text not null,   -- XML <s id="...">
-
+    -- planned values (from timetables)
     planned_arrival_ts timestamp,
     planned_departure_ts timestamp,
-    planned_arrival_platform text,
-    planned_departure_platform text,
+    previous_station_eva bigint,
+    next_station_eva bigint,
 
+    -- changed values (from timetable_changes)
     changed_arrival_ts timestamp,
     changed_departure_ts timestamp,
+    changed_previous_station_eva bigint,
+    changed_next_station_eva bigint,
 
+    -- cancellation
     arrival_cancelled boolean not null default false,
     departure_cancelled boolean not null default false,
 
+    -- delays
     arrival_delay_min integer,
     departure_delay_min integer,
 
-    previous_station_eva bigint,
-    next_station_eva bigint,
-    
+    -- visibility flags (from planned)
     arrival_is_hidden boolean not null default false,
     departure_is_hidden boolean not null default false,
 
@@ -88,14 +91,29 @@ create table if not exists dw.fact_movement (
 
     constraint fk_fact_train
         foreign key (train_id) references dw.dim_train(train_id),
-    
+        
     constraint fk_fact_prev_station
         foreign key (previous_station_eva) references dw.dim_station(station_eva),
 
     constraint fk_fact_next_station
-        foreign key (next_station_eva) references dw.dim_station(station_eva)
+        foreign key (next_station_eva) references dw.dim_station(station_eva),
+
+    constraint fk_fact_changed_prev_station
+        foreign key (changed_previous_station_eva) references dw.dim_station(station_eva),
+
+    constraint fk_fact_changed_next_station
+        foreign key (changed_next_station_eva) references dw.dim_station(station_eva)
 );
 
--- index for fuzzy matching (requires pg_trgm extension)
+-- -----------------------------
+-- Indexes
+-- -----------------------------
+
+-- fuzzy matching (requires pg_trgm extension)
 create index if not exists dim_station_name_trgm_idx
 on dw.dim_station using gin (station_name_search gin_trgm_ops);
+
+-- IMPORTANT performance index for changes ingestion:
+-- speeds "latest planned/as-of <= snapshot_key" lookups by station_eva + stop_id.
+create index if not exists idx_fact_movement_station_stop_snapshot
+on dw.fact_movement (station_eva, stop_id, snapshot_key desc);
