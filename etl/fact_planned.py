@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import psycopg2.extras
 import xml.etree.ElementTree as ET
@@ -21,9 +21,6 @@ GENERIC = {
 
 
 def _split_path_list(path_str: Optional[str]) -> List[str]:
-    """
-    Split ppth/cpth field: "A|B|C" -> ["A","B","C"]
-    """
     if not path_str:
         return []
     parts = [p.strip() for p in path_str.split("|")]
@@ -37,13 +34,6 @@ def get_prev_next_station_raw(
     ar_hidden: bool,
     dp_hidden: bool,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (previous_station_name, next_station_name) raw strings.
-
-    Uses cpth if present else ppth.
-    - prev from arrival: last station in (c)pth
-    - next from departure: first station in (c)pth
-    """
     prev_raw: Optional[str] = None
     next_raw: Optional[str] = None
 
@@ -65,7 +55,6 @@ def get_prev_next_station_raw(
 # ---------- dimension lookups ----------
 
 def load_train_map(cur) -> Dict[Tuple[str, str], int]:
-    """(category, train_number) -> train_id"""
     cur.execute("select train_id, category, train_number from dw.dim_train;")
     return {(c, n): int(tid) for (tid, c, n) in cur.fetchall()}
 
@@ -94,69 +83,44 @@ def _core_token_regex(station_search: str) -> Optional[str]:
     toks = _core_tokens(station_search)
     if not toks:
         return None
-    # whole-word match for any core token
-    # e.g. \m(gesundbrunnen|leipzig)\M
     return r"\m(" + "|".join(re.escape(t) for t in toks) + r")\M"
 
 
 def _core_search_string(station_search: str) -> str:
-    """
-    Remove GENERIC tokens (and 1-char junk) from a normalized station_search string.
-    Used for scoring so that qualifiers like 's bahn' don't drag the similarity down.
-    """
     toks = _core_tokens(station_search)
     return " ".join(toks)
 
 
 def to_station_search_name(name: str) -> str:
-    """
-    Must match how you populate dim_station.station_name_search.
-    """
     s = (name or "").strip().lower()
 
-    # German folding (more robust for fuzzy matching / filenames)
-    s = (s.replace("ß", "s") # not ss but s
+    s = (s.replace("ß", "s")
            .replace("ä", "a")
            .replace("ö", "o")
            .replace("ü", "u"))
 
-    # If filenames use '_' as a placeholder inside words (e.g. s_d for süd),
-    # don't turn it into a space — remove it when it's between word chars.
     s = re.sub(r"(?<=\w)_(?=\w)", "", s)
 
-    # hbf (word + suffix)
     s = re.sub(r"\bhbf\b\.?", " hauptbahnhof ", s)
     s = re.sub(r"(?<=\w)hbf\b\.?", "hauptbahnhof", s)
 
-    # bf (word + suffix) — suffix excludes "...hbf"
     s = re.sub(r"\bbf\b\.?", " bahnhof ", s)
     s = re.sub(r"(?<=\w)(?<!h)bf\b\.?", "bahnhof", s)
 
-    # str (word + suffix)
     s = re.sub(r"\bstr\b\.?", " strase ", s)
     s = re.sub(r"(?<=\w)str\b\.?", "strase", s)
     s = re.sub(r"\b(\w+)\s+strase\b", r"\1strase", s)
 
     s = re.sub(r"\bberlin\b", " ", s)
 
-    # Keep underscore already handled; now strip everything else to spaces
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def station_name_from_timetable_filename(xml_path: str) -> str:
-    """
-    Extract a station-ish string from a timetable filename.
-    IMPORTANT: do NOT blindly replace '_' with spaces, because '_' may be used
-    inside words as an umlaut placeholder (e.g. s_d for süd).
-    """
     stem = Path(xml_path).stem.lower().strip()
     stem = re.sub(r"(?:_timetable|_timetables)$", "", stem)
-
-    # Keep underscores for now; just strip weird chars (keep _ so to_station_search_name can handle it)
-    #stem = re.sub(r"[^a-z0-9_\s]", " ", stem)
-    #stem = re.sub(r"\s+", " ", stem).strip()
     return stem
 
 
@@ -171,17 +135,10 @@ def resolve_station_eva(
     threshold: float,
     cache: Optional[Dict[str, Optional[int]]] = None,
 ) -> Optional[int]:
-    """
-    Candidate restriction uses core tokens.
-    Scoring uses core-search-string so that qualifiers like '(S-Bahn)' don't drag score down.
-    Logs top candidate + score ALWAYS (station_resolve_log).
-    Auto-links only if score >= threshold; else upserts into needs_review.
-    """
     station_search_full = to_station_search_name(station_raw)
     if not station_search_full:
         return None
 
-    # Use core string for scoring + caching (so "Berlin Hbf (S-Bahn)" and "Berlin Hbf" share cache)
     score_query = _core_search_string(station_search_full) or station_search_full
     cache_key = score_query
 
@@ -235,7 +192,6 @@ def resolve_station_eva(
         )
     )
 
-    # Always log the attempt (log BOTH raw + full search + score query)
     cur.execute(
         """
         insert into dw.station_resolve_log (
@@ -305,7 +261,6 @@ def get_station_eva_for_timetable(
         )
 
     station_guess_raw = station_name_from_timetable_filename(os.path.basename(xml_path))
-    # normalize using the SAME function used everywhere else
     station_guess = to_station_search_name(station_guess_raw)
     return resolve_station_eva(
         cur,
@@ -320,10 +275,6 @@ def get_station_eva_for_timetable(
 # ---------- snapshot discovery ----------
 
 def iter_timetable_snapshots(timetables_root: str = "timetables") -> Iterator[str]:
-    """
-    Finds snapshot folders under timetables/**/<snapshot_key>/
-    Example: timetables/2509/250902/2509021400/*.xml (your structure may vary)
-    """
     for p in glob.glob(os.path.join(timetables_root, "**", "[0-9]" * 10), recursive=True):
         if os.path.isdir(p):
             key = os.path.basename(p)
@@ -357,8 +308,7 @@ def upsert_fact_movement_for_snapshot(
             root = ET.parse(path).getroot()
         except ET.ParseError:
             continue
-        
-        # NEW: skip empty timetable files (no <s> stop tags)
+
         stops = root.findall("./s")
         if not stops:
             continue
@@ -388,7 +338,6 @@ def upsert_fact_movement_for_snapshot(
             if not cat or not num:
                 continue
 
-            # FILTER: skip buses entirely
             if cat.lower() == "bus":
                 continue
 
@@ -420,21 +369,11 @@ def upsert_fact_movement_for_snapshot(
             ar_hidden = (ar is not None and ar.get("hi") == "1")
             dp_hidden = (dp is not None and dp.get("hi") == "1")
 
-            # If both hidden, it is not a passenger-relevant stop
             if ar_hidden and dp_hidden:
                 continue
 
-            ar_ts = None
-            ar_pp = None
-            if ar is not None and not ar_hidden:
-                ar_ts = parse_yyMMddHHmm(ar.get("pt"))
-                ar_pp = ar.get("pp") or None
-
-            dp_ts = None
-            dp_pp = None
-            if dp is not None and not dp_hidden:
-                dp_ts = parse_yyMMddHHmm(dp.get("pt"))
-                dp_pp = dp.get("pp") or None
+            planned_ar_ts = parse_yyMMddHHmm(ar.get("pt")) if (ar is not None and not ar_hidden) else None
+            planned_dp_ts = parse_yyMMddHHmm(dp.get("pt")) if (dp is not None and not dp_hidden) else None
 
             prev_raw, next_raw = get_prev_next_station_raw(
                 ar=ar, dp=dp, ar_hidden=ar_hidden, dp_hidden=dp_hidden
@@ -461,8 +400,7 @@ def upsert_fact_movement_for_snapshot(
                     threshold=threshold,
                     cache=station_cache,
                 )
-            
-            # Prevent self-loops
+
             if previous_station_eva == station_eva:
                 previous_station_eva = None
             if next_station_eva == station_eva:
@@ -474,14 +412,12 @@ def upsert_fact_movement_for_snapshot(
                     station_eva,
                     train_id,
                     stop_id,
-                    ar_ts,
-                    dp_ts,
-                    ar_pp,
-                    dp_pp,
-                    ar_hidden,
-                    dp_hidden,
+                    planned_ar_ts,
+                    planned_dp_ts,
                     previous_station_eva,
                     next_station_eva,
+                    ar_hidden,
+                    dp_hidden,
                 )
             )
 
@@ -496,46 +432,51 @@ def upsert_fact_movement_for_snapshot(
             station_eva,
             train_id,
             stop_id,
+
             planned_arrival_ts,
             planned_departure_ts,
-            planned_arrival_platform,
-            planned_departure_platform,
+            previous_station_eva,
+            next_station_eva,
+
             changed_arrival_ts,
             changed_departure_ts,
+            changed_previous_station_eva,
+            changed_next_station_eva,
+
             arrival_cancelled,
             departure_cancelled,
             arrival_delay_min,
             departure_delay_min,
+
             arrival_is_hidden,
-            departure_is_hidden,
-            previous_station_eva,
-            next_station_eva
+            departure_is_hidden
         )
         values %s
         on conflict (snapshot_key, station_eva, stop_id) do update
-        set train_id = excluded.train_id,
+        set
+            train_id = excluded.train_id,
             planned_arrival_ts = excluded.planned_arrival_ts,
             planned_departure_ts = excluded.planned_departure_ts,
-            planned_arrival_platform = excluded.planned_arrival_platform,
-            planned_departure_platform = excluded.planned_departure_platform,
-            arrival_is_hidden = excluded.arrival_is_hidden,
-            departure_is_hidden = excluded.departure_is_hidden,
             previous_station_eva = excluded.previous_station_eva,
-            next_station_eva = excluded.next_station_eva
+            next_station_eva = excluded.next_station_eva,
+            arrival_is_hidden = excluded.arrival_is_hidden,
+            departure_is_hidden = excluded.departure_is_hidden
         """,
         [
             (
                 sk, eva, tid, sid,
-                ar_ts, dp_ts, ar_plat, dp_plat,
-                None, None,
-                False, False,
-                None, None,
-                ar_hidden,
-                dp_hidden,
-                prev_eva,
-                next_eva,
+                ar_ts, dp_ts,
+                prev_eva, next_eva,
+
+                None, None,  # changed_arrival_ts / changed_departure_ts
+                None, None,  # changed_previous_station_eva / changed_next_station_eva
+
+                False, False,  # cancellations
+                None, None,    # delays
+
+                ar_hidden, dp_hidden,
             )
-            for (sk, eva, tid, sid, ar_ts, dp_ts, ar_plat, dp_plat, ar_hidden, dp_hidden, prev_eva, next_eva) in rows
+            for (sk, eva, tid, sid, ar_ts, dp_ts, prev_eva, next_eva, ar_hidden, dp_hidden) in rows
         ],
         page_size=page_size,
     )
@@ -553,11 +494,6 @@ def upsert_fact_movement_from_all_timetables(
     page_size: int = 5000,
     commit_every: int = 1,
 ) -> Dict[str, int]:
-    """
-    Walk all snapshot folders under timetables_root and ingest each.
-    Returns dict snapshot_key -> inserted_row_count.
-    """
-    # distinct + sorted for stable progress output
     snapshot_keys = sorted(set(iter_timetable_snapshots(timetables_root)))
 
     results: Dict[str, int] = {}
@@ -571,7 +507,6 @@ def upsert_fact_movement_from_all_timetables(
         )
         results[sk] = n
 
-        # optional: you can commit outside this function; but if you want chunk commits:
         if commit_every > 0 and hasattr(cur, "connection") and (i % commit_every == 0):
             cur.connection.commit()
 
