@@ -332,3 +332,45 @@ python ingestion.py --step planned --snapshot 2509021400 --threshold 0.75
 # python ingestion.py --step changed (coming soon...)
 ```
 
+-----
+
+# Documentation for the python pipeline
+
+## Ingesting station data (`stations.py`)
+
+We parse `stations.json` and iterate over `result` (a list of station objects). For each station:
+- We read the station name (`name`) and its `evaNumbers` array.
+- We select the entry where `evaNumbers[].isMain == true` and extract:
+    - `number` as the main EVA identifier
+    - `geographicCoordinates.coordinates` as `(lon, lat)`
+- We normalize the station name with `to_station_search_name()`
+- We upsert one row into `dw.dim_station` with:
+    - `station_eva` (primary key; main EVA number)
+    - `station_name` (raw name from JSON)
+    - `station_name_search` (normalized name)
+    - `lon`, `lat` (coordinates)
+
+The ingestion is idempotent: on conflict (`station_eva`) we update name/search/coordinates.
+
+## Ingesting train data (`trains.py`)
+
+We iterate over all timetable XML files under `/timetables/**` and extract train identifiers from each `<tl>` element:
+- `tl@c`  $\rightarrow$ `category`
+- `tl@n` $\rightarrow$ `train_number`
+- We skip entries where `category` is `"Bus"` (case-insensitive).
+- We de-duplicate `(category, train_number)` pairs in memory and insert them into `dw.dim_train`.
+
+`train_id` is a database-generated surrogate key. We rely on a unique constraint on `(category, train_number)` (`ON CONFLICT DO NOTHING`) and then query `dw.dim_train` to build a mapping `(category, train_number) -> train_id` for fact-table ingestion.
+
+## Ingesting time snapshots (`time_dim.py`)
+
+We derive time-dimension rows from the snapshot keys encoded in folder names:
+- Timetables: `/timetables/{YYMMDDHH00}/...` (hourly snapshots)
+- Timetable changes: `/timetable_changes/{YYMMDDHHmm}/...` (15-minute snapshots)
+
+We discover all snapshot keys (10 digits `YYMMDDHHmm`), parse them into:
+- `snapshot_key` (PK, string key from folder name)
+- `snapshot_ts` (timestamp)
+- `snapshot_date` (date)
+- `hour`, `minute`
+We upsert into `dw.dim_time` on conflict (`snapshot_key`) to keep the pipeline idempotent.
