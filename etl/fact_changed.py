@@ -1,4 +1,3 @@
-# etl/fact_changed.py
 from __future__ import annotations
 
 import glob

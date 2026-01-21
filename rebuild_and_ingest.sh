@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
-# Make it executable:
-# chmod +x rebuild_and_ingest.sh
+
+# Make it executable: chmod +x rebuild_and_ingest.sh
+# export DB_USER=<user_name>
+# ./rebuild_and_ingest.sh
 
 set -euo pipefail
 
