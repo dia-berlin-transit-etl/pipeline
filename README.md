@@ -374,3 +374,40 @@ We discover all snapshot keys (10 digits `YYMMDDHHmm`), parse them into:
 - `snapshot_date` (date)
 - `hour`, `minute`
 We upsert into `dw.dim_time` on conflict (`snapshot_key`) to keep the pipeline idempotent.
+
+## Ingesting planned movements (`fact_planned.py`)
+
+We ingest the "planned" schedule snapshots from `/timetables` and write them into `dw.fact_movement`. For each snapshot folder (`snapshot_key = YYMMDDHHmm`):
+- We iterate over all station XML files in that snapshot and parse the root element.
+- We resolve the station EVA (`station_eva`) for the file using:
+    1. `root@eva` if present, else
+    2. `root@station` (resolved by name), else
+    3. a filename-derived station name.  
+        Name-based resolving uses `pg_trgm` similarity against `dw.dim_station.station_name_search`. Every attempt is logged into `dw.station_resolve_log`, and uncertain matches are written into `dw.needs_review`.
+
+For each `<s>` stop element in the station file:
+- We read `s@id` as `stop_id` (the stop identifier in the dataset).
+- We read the train descriptor from `<tl>`:
+    - `tl@c` $\rightarrow$ `category`
+    - `tl@n` $\rightarrow$ `train_number`  
+        We skip entries where `category == "Bus"`. We map `(category, train_number)` to `train_id` via `dw.dim_train` (creating the train row if missing).
+- We read arrival and departure nodes (if present): `<ar>` and `<dp>`.
+    - We mark an event as hidden if `hi="1"`.
+    - We skip the stop only if both arrival and departure are hidden.  
+        Otherwise we keep the stop and store:
+        - `planned_arrival_ts` from `ar@pt` only if arrival is not hidden
+        - `planned_departure_ts` from `dp@pt` only if departure is not hidden
+        - `arrival_is_hidden`, `departure_is_hidden` flags in the fact row
+- We infer previous/next stations from the path fields:
+    - For the arrival event (if present and not hidden), we use `ar@cpth` else `ar@ppth` and take the last station name in the pipe-separated list as the previous station.
+    - For the departure event (if present and not hidden), we use `dp@cpth` else `dp@ppth` and take the first station name in the pipe-separated list as the next station. 
+        These raw names are resolved to EVA numbers using the same station resolver. If the resolver returns the current `station_eva` as previous/next, we set that value to `NULL` to avoid "previous/next=current" artifacts.
+
+We then upsert one row per `(snapshot_key, station_eva, stop_id)` into `dw.fact_movement`, filling only the planned-related fields:
+- `train_id`, `planned_arrival_ts`, `planned_departure_ts`
+- `previous_station_eva`, `next_station_eva`
+- `arrival_is_hidden`, `departure_is_hidden`
+
+All change-related fields (`changed_*`, cancellation flags, delays) remain at their defaults (`NULL` / `false`) in planned ingestion.
+
+The ingestion is idempotent: on conflict (`snapshot_key, station_eva, stop_id`) we update the planned fields for that snapshot row, so repeated runs do not create duplicates.
