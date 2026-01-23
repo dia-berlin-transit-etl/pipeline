@@ -502,3 +502,101 @@ Each as-of row is unique by `(snapshot_key, station_eva, stop_id)`. We upsert on
 - This makes re-running the changes step safe and repeatable.
 
 This design allows querying a stop's evolution by selecting all rows for the same `(station_eva, stop_id)` ordered by `snapshot_key`, where each row represents the state "as of" that snapshot.
+
+## Appendix: Station name resolution (pg_trgm–based fuzzy matching)
+
+Our raw timetable files reference stations in multiple inconsistent ways (root EVA number, station name strings, or filename-derived names). To map any station mention to the canonical station dimension (`dw.dim_station`), we use a fuzzy-matching resolver based on PostgreSQL trigram similarity (`pg_trgm`).
+
+### Inputs and output
+
+Input to the resolver:
+- `station_raw`: the station string to resolve (e.g., `"Berlin-Charlottenburg"`, `"alexanderplatz"`, `"s_dkreuz"` from filenames, etc.)
+- `snapshot_key`, `source_path`: metadata for auditing/logging
+- `threshold`: similarity cutoff for "auto-linking"
+
+Output:
+- `station_eva` (`BIGINT`) if confidently matched, otherwise `NULL`.
+
+### Normalization (`to_station_search_name()`)
+
+Before matching, we normalize station strings into a searchable form. The goal is to reduce spelling/formatting noise so that fuzzy matching is robust.
+
+Normalization steps (in order):
+- lowercasing + trimming
+- German character folding:
+    - `ß -> s`, `ä -> a`, `ö -> o`, `ü -> u`
+- special handling for underscores inside words (used as umlaut placeholders in filenames):
+    - `s_d → sd` (underscore removed only when between word characters)
+- expand/normalize common abbreviations:
+    - `hbf -> hauptbahnhof`
+    - `bf -> bahnhof` (excluding "hbf")
+    - `str -> strase` and joining patterns like `"osdorfer strase" -> "osdorferstrase"`
+- drop the token `"berlin"` (so `"Berlin Gesundbrunnen"` matches `"Gesundbrunnen"`)
+- replace all remaining non-alphanumeric characters with spaces
+- collapse multiple spaces
+
+The resulting string is stored in:
+- `dw.dim_station.station_name_search` (for canonical stations from `stations.json`)
+- `station_search_full` (for each resolution attempt)
+
+### Core-token filtering (avoid matching on generic words)
+
+Some tokens occur in many station names and are not helpful for matching (e.g., `"bahnhof"`, `"hauptbahnhof"`, `"station"`, `"sbahn"`, `"ubahn"`). We define a small set of generic tokens and build a "core token list":
+- Split `station_search_full` into tokens
+- Keep only tokens with length $\geq$ 2
+- Drop tokens in the `GENERIC` set
+
+If we have at least one core token, we build:
+- `score_query = " ".join(core_tokens)` (or fall back to full normalized string if core tokens are empty)
+- `core_pat` = a word-boundary regex matching any core token, e.g. `\m(token1|token2)\M`
+
+This reduces false positives where the similarity score is high only because of generic words.
+
+### Fuzzy matching query (pg_trgm)
+
+We select the single best candidate station from `dw.dim_station` using pg_trgm:
+- If `core_pat` exists, we restrict candidates to those containing at least one core token.
+- If core tokens are empty (rare), we scan without the regex restriction.
+
+### Auto-link decision (threshold + fallback rule)
+
+After retrieving the best candidate `(best_station_eva, best_score)`:
+- If we have core tokens:
+    - auto-link if `best_score >= threshold` (e.g., `0.52` in our runs)
+- If we do not have core tokens:
+    - auto-link only if `best_score >= 0.72` (stricter fallback to avoid generic matches)
+
+If auto-linking fails, the resolver returns `NULL`.
+
+### Auditing and manual review support
+
+Every resolution attempt is recorded in `dw.station_resolve_log`:
+- `snapshot_key`, `source_path`
+- `station_raw`, `station_search` (normalized)
+- best candidate EVA/name, best score
+- `auto_linked` boolean
+
+If auto-linking fails or is borderline, we also upsert into `dw.needs_review` keyed by `station_search`, storing:
+- best candidate and score
+- last snapshot where it was seen
+- last source file
+
+This lets us inspect unresolved or ambiguous station names and improve normalization or station data if needed.
+
+### Where station strings come from in the pipeline
+
+The resolver is used in three places:
+1. Station file identity (`station_eva`)
+	- Prefer `root@eva`
+	- Else resolve `root@station`
+	- Else resolve filename-derived station string
+
+2. Path-based neighboring stations (prev/next)
+	- From `ppth`/`cpth` lists in `<ar>` / `<dp>`:
+	    - previous station from arrival path (last element)
+	    - next station from departure path (first element)
+
+3. Changes path updates
+	- Same path logic, stored in `changed_previous_station_eva` / `changed_next_station_eva`
+
+In all cases, the same normalization + pg_trgm matching + auditing logic is applied, so station identity is consistent across planned and changes ingestion.
