@@ -600,3 +600,117 @@ The resolver is used in three places:
 	- Same path logic, stored in `changed_previous_station_eva` / `changed_next_station_eva`
 
 In all cases, the same normalization + pg_trgm matching + auditing logic is applied, so station identity is consistent across planned and changes ingestion.
+
+
+## Task 2: SQL Queries
+
+### 2.1
+
+```sql
+SELECT station_eva, station_name, lon, lat
+FROM dw.dim_station
+WHERE station_name = '...';
+```
+
+We store coordinate information in the table `dim_station` as `lon` and `lat`, which makes it straightforward to return these. `station_eva` is returned as well which is the primary key to the table `dim_station`.
+
+### 2.2
+
+```sql
+PREPARE get_closest_station(double precision, double precision) AS
+SELECT station_eva, station_name, lon, lat
+FROM dw.dim_station
+ORDER BY (
+  power(lat - $1, 2) +
+  power((lon - $2) * cos(radians($1)), 2)
+)
+LIMIT 1;
+```
+
+We select the same fields as the previous task and we order them by measuring the euclidian distance of the _equirectangular approximation_ of the coordinates. We return the top row with `LIMIT 1`.
+
+### 2.3
+
+```sql
+WITH params AS (
+  SELECT '...'::text AS s  -- snapshot S
+),
+latest AS (
+  SELECT DISTINCT ON (fm.station_eva, fm.stop_id)
+    fm.station_eva,
+    fm.stop_id,
+    fm.train_id,
+    fm.arrival_cancelled,
+    fm.departure_cancelled
+  FROM dw.fact_movement fm
+  JOIN params p ON true
+  WHERE fm.snapshot_key <= p.s
+  ORDER BY fm.station_eva, fm.stop_id, fm.snapshot_key DESC, fm.movement_key DESC
+),
+canceled_station_train AS (
+  SELECT DISTINCT
+    station_eva,
+    train_id
+  FROM latest
+  WHERE arrival_cancelled OR departure_cancelled
+)
+SELECT
+  COUNT(*) AS cancellations_per_station_total
+FROM canceled_station_train;
+
+```
+
+To count cancellations at a given snapshot cutoff `S`, we treat `dw.fact_movement` as an "as-of" fact table and first restrict rows to `snapshot_key <= S`. Because each stop `(station_eva, stop_id)` can appear in multiple snapshots (planned baseline plus later updates), we select the most recent row per movement using `DISTINCT ON ... ORDER BY snapshot_key DESC`. We then keep only rows where either `arrival_cancelled` or `departure_cancelled` is true. To follow the requirement "count a train cancelled once per station", we deduplicate by `(station_eva, train_id)` and finally count these distinct station-train pairs. This yields the number of trains that are cancelled at each station according to the latest available state up to snapshot `S`.
+
+### 2.4
+
+```sql
+WITH st AS (
+  SELECT station_eva, station_name
+  FROM dw.dim_station
+  WHERE station_name = '...'  -- input station name
+),
+
+latest AS (
+  SELECT DISTINCT ON (fm.station_eva, fm.stop_id)
+    fm.station_eva,
+    fm.stop_id,
+    fm.arrival_delay_min,
+    fm.departure_delay_min,
+    fm.arrival_cancelled,
+    fm.departure_cancelled,
+    fm.arrival_is_hidden,
+    fm.departure_is_hidden
+  FROM dw.fact_movement fm
+  JOIN st ON st.station_eva = fm.station_eva
+  ORDER BY fm.station_eva, fm.stop_id, fm.snapshot_key DESC, fm.movement_key DESC
+),
+
+delay_obs AS (
+  SELECT arrival_delay_min AS delay_min
+  FROM latest
+  WHERE arrival_delay_min IS NOT NULL
+    AND arrival_delay_min >= 0
+    AND arrival_cancelled = FALSE
+    AND arrival_is_hidden = FALSE
+
+  UNION ALL
+
+  SELECT departure_delay_min AS delay_min
+  FROM latest
+  WHERE departure_delay_min IS NOT NULL
+    AND departure_delay_min >= 0
+    AND departure_cancelled = FALSE
+    AND departure_is_hidden = FALSE
+)
+SELECT
+  st.station_name,
+  st.station_eva,
+  AVG(delay_min)::double precision AS avg_delay_min,
+  COUNT(*) AS n_delay_observations
+FROM delay_obs
+JOIN st ON true
+GROUP BY st.station_name, st.station_eva;
+```
+
+To compute the average delay for a station, we first resolve the station name to its `station_eva` in `dw.dim_station`. Since `dw.fact_movement` stores multiple "as-of" rows over time for the same stop, we collapse the timeline by selecting the most recent row per movement key `(station_eva, stop_id)` using `DISTINCT ON ... ORDER BY snapshot_key DESC`. From these latest rows, we extract delay observations from both arrival and departure (`arrival_delay_min`, `departure_delay_min`) and union them into a single stream of numbers. We exclude invalid observations by filtering out `NULL` delays, negative delays, cancelled events, and hidden events. Finally, we compute `AVG(delay_min)` and report the number of included observations as a sanity check.
