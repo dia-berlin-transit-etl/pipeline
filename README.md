@@ -411,3 +411,94 @@ We then upsert one row per `(snapshot_key, station_eva, stop_id)` into `dw.fact_
 All change-related fields (`changed_*`, cancellation flags, delays) remain at their defaults (`NULL` / `false`) in planned ingestion.
 
 The ingestion is idempotent: on conflict (`snapshot_key, station_eva, stop_id`) we update the planned fields for that snapshot row, so repeated runs do not create duplicates.
+
+
+
+## Ingesting timetable updates (`fact_changed.py`)
+
+After the planned baseline is loaded from `/timetables`, we ingest incremental updates from `/timetable_changes`. Each changes snapshot represents the current state at time `snapshot_key = YYMMDDHHmm`. The goal is to create a new fact row for that snapshot by copying the latest known planned context for the same stop and then applying any updates (delay, cancellation, path change).
+
+### Reading a changes snapshot and resolving station/train IDs
+
+For each station XML file in the snapshot:
+- We resolve the station EVA (`station_eva`) using the same strategy as planned ingestion:
+    1. `root@eva`, else
+    2. `root@station` (name-based resolve), else
+    3. filename-derived station name.  
+        Name resolves are done via `pg_trgm` similarity on `dw.dim_station.station_name_search`, with all attempts logged to `dw.station_resolve_log` and uncertain matches added to `dw.needs_review`.
+        
+For each `<s>` stop element:
+- We read `s@id` as `stop_id`.
+- We read `<tl c="..." n="...">` to obtain `(category, train_number)` and map it to `train_id` (creating the train if missing). We skip `"Bus"`.
+
+### Extracting update signals from `<ar>` and `<dp>`
+
+For the arrival `<ar>` and departure `<dp>` nodes we parse:
+- Changed times
+    - `ar@ct` $\rightarrow$ `changed_arrival_ts`
+    - `dp@ct` $\rightarrow$ `changed_departure_ts`
+- Cancellation state (authoritative signal: `cs`)  
+    We interpret `cs` as the current cancellation status for that event:
+    - `cs = 'c'` $\rightarrow$ cancelled now
+    - `cs = 'p'` or `cs = 'a'` $\rightarrow$ explicitly not cancelled now (e.g. revocation / planned / added)
+    - `cs` missing $\rightarrow$ no update; we will carry forward the previous cancellation state from the base row  
+        We do not treat `clt` as the cancellation state because it can appear in inconsistent combinations (e.g. together with `cs='p'`).
+		**Revoked cancellations:** A previously cancelled event can be revoked by a later update with `cs='p'` (or `cs='a'`). We reset `arrival_cancelled` / `departure_cancelled` back to `false` whenever `cs` indicates a non-cancelled state. If `cs` is missing, we keep (carry forward) the base cancellation flags.
+- Added stops  
+    A stop can exist only in `timetable_changes` (i.e., there is no planned row). We detect such "added" stops if any of:
+    - `ps = 'a'` on `<ar>` or `<dp>`, or
+    - `cs = 'a'` on `<ar>` or `<dp>`, or
+    - the integer suffix of `stop_id` (after the last `-`) is `>= 100`
+- Hidden flags  
+    We read `hi="1"` into `arrival_is_hidden` / `departure_is_hidden` (stored on the as-of row). Unlike planned ingestion, we do not drop the stop unless we decide the stop has no meaningful update signals.
+- Changed path (prev/next)  
+    If a path is present, we prefer `cpth` else `ppth`:
+    - previous station comes from the last station in the arrival path list
+    - next station comes from the first station in the departure path list  
+        These station names are resolved (pg_trgm) and stored as `changed_previous_station_eva` / `changed_next_station_eva` (self-resolves to the current station are nulled).
+
+We keep a stop only if it contains at least one meaningful signal (a changed/planned time, a cancellation signal, a path update, or is detected as an added stop).
+
+### Chaining logic: choose the latest base row for each stop key
+
+A stop is identified across time by `(station_eva, stop_id)`. Because changes arrive in multiple snapshots, we must apply each new snapshot on top of the latest available row (planned or already changed).
+
+For each `(station_eva, stop_id)` observed in the current changes snapshot `S`, we fetch the base row as:
+- base row = the row in `dw.fact_movement` with the same `(station_eva, stop_id)` and the maximum `snapshot_key` such that `snapshot_key <= S`
+
+Later changes snapshots build on the latest known state, not necessarily the original planned snapshot.
+
+### Writing the "as-of" row for snapshot S
+
+For each stop key `(station_eva, stop_id)` we insert a new row at snapshot `S`:
+- Copy planned fields from the base row
+    - `train_id`
+    - `planned_arrival_ts`, `planned_departure_ts`
+    - `previous_station_eva`, `next_station_eva`
+    - `arrival_is_hidden`, `departure_is_hidden` (unless overridden by flags in the change file)
+- Apply updates from the change snapshot
+    - `changed_arrival_ts`, `changed_departure_ts` from `ct`
+    - `arrival_cancelled`, `departure_cancelled`:
+        - if `cs` is present for that event, use it
+        - otherwise carry forward the base row's cancellation state
+    - `arrival_delay_min`, `departure_delay_min`:
+        - computed only when the event is not cancelled, the planned timestamp exists, and the changed timestamp exists
+        - delay = `(changed_ts - planned_ts)` in minutes
+    - optional path update:
+        - `changed_previous_station_eva`, `changed_next_station_eva` from `cpth`/`ppth`
+
+### Handling added stops with no planned base row
+
+If no base row exists for `(station_eva, stop_id)` with `snapshot_key <= S`, we only insert the row if it is detected as an added stop. In that case:
+- We build the planned timestamps from `pt` if available, otherwise leave them `NULL` (and use `ct` as the changed timestamps if present).
+- We require a valid `train_id` from `<tl>` because `fact_movement.train_id` is `NOT NULL`.
+- Cancellation defaults to "not cancelled" unless a `cs='c'` explicitly indicates cancellation.
+- Prev/next station references are derived from the path fields (prefer `cpth`, else `ppth`) and stored both as base prev/next (best available topology) and optionally as changed prev/next.
+
+### Idempotency
+
+Each as-of row is unique by `(snapshot_key, station_eva, stop_id)`. We upsert on this key:
+- If the row already exists for snapshot `S`, we overwrite the changed fields (and keep the planned context for that snapshot row consistent).
+- This makes re-running the changes step safe and repeatable.
+
+This design allows querying a stop's evolution by selecting all rows for the same `(station_eva, stop_id)` ordered by `snapshot_key`, where each row represents the state "as of" that snapshot.
