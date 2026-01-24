@@ -1,6 +1,8 @@
 # Exclude folders containing the decompressed data
 /timetables/
 /timetable_changes/
+/logs/
+/output/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

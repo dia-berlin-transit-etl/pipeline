@@ -39,6 +39,7 @@ services:
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
       - ./output:/opt/spark-data/movements:rw
+      - ./logs:/opt/spark-data/logs:rw
     command: >
       bash -c "mkdir -p /opt/spark/work-dir/.ivy2 &&
                /opt/spark/sbin/start-master.sh &&
@@ -50,14 +51,15 @@ services:
     depends_on:
       - spark-master
     environment:
-      - SPARK_WORKER_CORES=6 # Adjust based on your CPU
-      - SPARK_WORKER_MEMORY=12G # Adjust based on your RAM
+      - SPARK_WORKER_CORES=2 # Adjust based on your CPU
+      - SPARK_WORKER_MEMORY=4G # Adjust based on your RAM
       - SPARK_SUBMIT_OPTS=-Divy.home=/opt/spark/work-dir/.ivy2
     volumes:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
       - ./output:/opt/spark-data/movements:rw
+      - ./logs:/opt/spark-data/logs:rw
     command: >
       bash -c "mkdir -p /opt/spark/work-dir/.ivy2 &&
                /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
