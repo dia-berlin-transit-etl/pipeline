@@ -114,7 +114,9 @@ Each `<s>` is one stop (one train calling at this station).
 
 ## Star schema design (DW schema `dw`)
 
-![Schema ERD](schema_erd.png)
+<!-- ![Schema ERD](schema_erd.png) -->
+<img src="schema_erd.png" alt="Schema ERD" width="600" />
+
 
 Our warehouse follows a star-schema layout with one central fact table (`dw.fact_movement`) and three core dimensions (`dw.dim_station`, `dw.dim_train`, `dw.dim_time`). The fact table stores the observed state of train movements per snapshot, while dimensions provide descriptive context for analysis.
 
