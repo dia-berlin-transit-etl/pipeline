@@ -112,11 +112,57 @@ Each `<s>` is one stop (one train calling at this station).
 
 
 
-## The Star Schema
-
-Three dimensions and one fact table.
+## Star schema design (DW schema `dw`)
 
 ![Schema ERD](schema_erd.png)
+
+Our warehouse follows a star-schema layout with one central fact table (`dw.fact_movement`) and three core dimensions (`dw.dim_station`, `dw.dim_train`, `dw.dim_time`). The fact table stores the observed state of train movements per snapshot, while dimensions provide descriptive context for analysis.
+
+### Dimensions
+
+- **`dw.dim_station` (station dimension)**  
+    Stores one row per station, identified by the main EVA number (`station_eva`, primary key). It contains descriptive attributes (`station_name`) and geographical coordinates (`lon`, `lat`). The additional column `station_name_search` is a normalized representation used for fuzzy station name resolution during ingestion (pg_trgm).
+- **`dw.dim_train` (train dimension)**  
+    Stores one row per train identity. It uses a surrogate key (`train_id`) and enforces uniqueness on the natural identifier `(category, train_number)`. This enables grouping and filtering by train category (e.g., S/RE/ICE) and train number.
+- **`dw.dim_time` (snapshot/time dimension)**  
+    Stores one row per snapshot folder (`snapshot_key = YYMMDDHHmm`). Besides the key, it provides derived attributes (`snapshot_ts`, `snapshot_date`, `hour`, `minute`). This dimension represents _observation time_ ("state as-of snapshot"), not the planned/changed event timestamps.
+
+### Fact table
+
+- **`dw.fact_movement` (movement fact table)**  
+    The fact table captures the planned schedule and its incremental updates. Each row represents the state of a single stop (`stop_id`) at a station (`station_eva`) for a given snapshot (`snapshot_key`) and train (`train_id`). Uniqueness is enforced by `(snapshot_key, station_eva, stop_id)`, allowing multiple "as-of" rows for the same stop over time (different snapshots).
+    
+    The fact table contains:
+    - **Keys (foreign keys to dimensions):**
+        - `snapshot_key -> dim_time`
+        - `station_eva -> dim_station`
+        - `train_id -> dim_train`
+    - **Planned attributes (from `/timetables`):**
+        - `planned_arrival_ts`, `planned_departure_ts`
+        - `previous_station_eva`, `next_station_eva`
+    - **Changed attributes (from `/timetable_changes`):**
+        - `changed_arrival_ts`, `changed_departure_ts`
+        - `changed_previous_station_eva`, `changed_next_station_eva`
+    - **Measures used in analysis:**
+        - cancellation flags (`arrival_cancelled`, `departure_cancelled`)
+        - delays (`arrival_delay_min`, `departure_delay_min`)
+        - visibility flags (`arrival_is_hidden`, `departure_is_hidden`)
+    Station references for previous/next and changed previous/next are implemented as additional foreign keys back to `dim_station` (role-playing station relationships).
+    
+
+### Audit tables (supporting ingestion quality)
+
+- **`dw.station_resolve_log`** records every station name resolution attempt (raw string, normalized string, best match, similarity score, and whether it was auto-linked).
+- **`dw.needs_review`** stores unresolved or low-confidence station strings for manual inspection.
+
+These tables are not part of the analytical star schema, but support data quality and debugging.
+
+### Indices
+
+- A trigram GIN index on `dim_station.station_name_search` accelerates fuzzy station lookup during ingestion.
+- The composite index `(station_eva, stop_id, snapshot_key DESC)` on `fact_movement` accelerates "latest as-of snapshot" lookups, which are required to chain timetable changes on to the most recent available state.
+
+
 
 ## Setup Ingestion:
 
