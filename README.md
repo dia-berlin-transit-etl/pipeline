@@ -157,7 +157,7 @@ Our warehouse follows a star-schema layout with one central fact table (`dw.fact
 - **`dw.station_resolve_log`** records every station name resolution attempt (raw string, normalized string, best match, similarity score, and whether it was auto-linked).
 - **`dw.needs_review`** stores unresolved or low-confidence station strings for manual inspection.
 
-These tables are not part of the analytical star schema, but support data quality and debugging.
+These tables are not part of the analytical star schema (and not included in the image above), but support data quality and debugging.
 
 ### Indices
 
