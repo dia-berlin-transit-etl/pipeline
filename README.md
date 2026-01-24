@@ -118,12 +118,12 @@ Three dimensions and one fact table.
 
 ![Schema ERD](schema_erd.png)
 
-## Ingestion:
+## Setup Ingestion:
 
 Create `.pgpass` file such that:
 ```sh
 cat ~/.pgpass
-localhost:5432:public_transport_db:user:password
+localhost:5432:public_transport_db:<user>:<password>
 ```
 
 and give the permissions:
@@ -131,10 +131,32 @@ and give the permissions:
 chmod 600 ~/.pgpass
 ```
 
+Create virtual environment and install requirements:
+
+```sh
+python -m venv .venv
+source .venv/bin/activate
+
+python -m pip install -r requirements.txt
+```
+
+Make the python ingestion script executable:
+```sh
+chmod +x rebuild_and_ingest.sh
+```
+
+Pass your DB username as env. var.:
+```sh
+export DB_USER=<user_name>
+```
+
 Run the script:
 ```sh
-python ingestion.py
+./rebuild_and_ingest.sh
 ```
+
+This script should create the schema and run the python ingestion scripts.
+If there is an error, there might be something lacking with your postgres configuration, for which you can read the below tips.
 
 
 ## Postgres CLI
@@ -181,33 +203,6 @@ GRANT SELECT, INSERT, UPDATE ON dw.dim_time TO efe;
 GRANT SELECT, INSERT, UPDATE ON dw.fact_movement TO efe;
 ```
 
-## Setup
-
-1. **Create and activate a virtual environment**
-
-   ```bash
-   python -m venv venv
-   source venv/bin/activate      # On macOS/Linux
-   venv\Scripts\activate         # On Windows
-   ```
-
-2. **Install dependencies**
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Running the ingestion scripts
-
-Run the scripts in this order:
-
-```sh
-python ingestion.py --step stations
-python ingestion.py --step trains
-python ingestion.py --step time
-python ingestion.py --step planned --snapshot 2509021400 --threshold 0.75
-# python ingestion.py --step changed (coming soon...)
-```
 
 -----
 
