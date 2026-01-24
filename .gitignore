@@ -4,6 +4,9 @@
 /logs/
 /output/
 
+# Graph map output
+stations_map.html
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
