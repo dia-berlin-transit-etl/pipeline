@@ -158,6 +158,9 @@ def export_leaflet_map(
         control_scale=True,
     )
 
+    arrow_lr = "\u2194"
+    arrow_r  = "\u2192"
+
     # edges (draw first so nodes appear on top)
     edge_count = 0
     for u, v, edata in G.edges(data=True):
@@ -177,17 +180,17 @@ def export_leaflet_map(
         first_seen = edata.get("first_seen_snapshot")
         last_seen = edata.get("last_seen_snapshot")
 
-        tooltip = f"{u_name} ↔ {v_name}"
+        tooltip = f"{u_name} {arrow_lr} {v_name}"
         if cat and num:
             tooltip += f" | {cat} {num}"
 
         popup_lines = [
-            f"<b>{u_name}</b> ↔ <b>{v_name}</b>",
+            f"<b>{u_name}</b> {arrow_lr} <b>{v_name}</b>",
             f"Sample train: {cat} {num}" if (cat and num) else "Sample train: (unknown)",
             f"Sample snapshot: {sample_snapshot}" if sample_snapshot else "Sample snapshot: (unknown)",
             f"Sample stop_id: {sample_stop_id}" if sample_stop_id else "Sample stop_id: (unknown)",
             f"Distinct trains on this edge: {n_trains}" if n_trains is not None else "Distinct trains: (unknown)",
-            f"Seen (baseline snapshots): {first_seen} → {last_seen}" if (first_seen and last_seen) else "Seen range: (unknown)",
+            f"Seen (baseline snapshots): {first_seen} {arrow_r} {last_seen}" if (first_seen and last_seen) else "Seen range: (unknown)",
         ]
         popup_html = "<br/>".join(popup_lines)
 
@@ -222,8 +225,6 @@ def export_leaflet_map(
     print(f"Wrote {out_html} with {G.number_of_nodes()} nodes and {edge_count} edges drawn.")
 
 
-
-# Shortest path by station_name
 def eva_by_station_name(conn, station_name: str) -> int:
     """
     Look up EVA by exact station_name (as given in stations.json).
