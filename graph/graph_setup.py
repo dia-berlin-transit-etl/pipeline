@@ -222,14 +222,72 @@ def export_leaflet_map(
     print(f"Wrote {out_html} with {G.number_of_nodes()} nodes and {edge_count} edges drawn.")
 
 
+
+# Shortest path by station_name
+def eva_by_station_name(conn, station_name: str) -> int:
+    """
+    Look up EVA by exact station_name (as given in stations.json).
+    Raises ValueError if not found or ambiguous.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT station_eva
+            FROM dw.dim_station
+            WHERE station_name = %s
+            """,
+            (station_name,),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        raise ValueError(f"Station name not found in dw.dim_station: {station_name!r}")
+    if len(rows) > 1:
+        evas = [int(r[0]) for r in rows]
+        raise ValueError(f"Ambiguous station_name {station_name!r} (multiple EVA): {evas}")
+    return int(rows[0][0])
+
+
+def shortest_path_by_name(G: nx.Graph, conn, src_name: str, dst_name: str) -> list[int]:
+    """
+    Unweighted shortest path (fewest hops) between two stations given by station_name.
+    Returns: list of EVA IDs along the path.
+    """
+    src_eva = eva_by_station_name(conn, src_name)
+    dst_eva = eva_by_station_name(conn, dst_name)
+
+    if src_eva not in G:
+        raise ValueError(f"Source EVA {src_eva} not in graph (did you load nodes/edges?)")
+    if dst_eva not in G:
+        raise ValueError(f"Target EVA {dst_eva} not in graph (did you load nodes/edges?)")
+
+    return nx.shortest_path(G, source=src_eva, target=dst_eva)
+
+
+def pretty_print_path(G: nx.Graph, path_evas: list[int]) -> None:
+    """
+    Prints EVA path as station names.
+    """
+    names = [G.nodes[eva].get("name", str(eva)) for eva in path_evas]
+    print(" -> ".join(names))
+    print(f"Hops: {max(0, len(path_evas) - 1)}")
+
+
 if __name__ == "__main__":
     G = nx.Graph()
     with get_conn() as conn:
         n_nodes = load_station_nodes(G, conn)
         n_edges = load_planned_edges(G, conn)
 
-    print(f"Loaded {n_nodes} station nodes.")
-    print(f"Loaded {n_edges} unique planned edges (with metadata).")
-    print("Graph:", G.number_of_nodes(), "nodes,", G.number_of_edges(), "edges")
+        print(f"Loaded {n_nodes} station nodes.")
+        print(f"Loaded {n_edges} unique planned edges (with metadata).")
+        print("Graph:", G.number_of_nodes(), "nodes,", G.number_of_edges(), "edges")
+
+        # shortest path query (edit these names)
+        src = "Karl-Bonhoeffer-Nervenklinik"
+        dst = "Tiergarten"
+        path = shortest_path_by_name(G, conn, src, dst)
+        print(f"\nShortest path (fewest hops) from {src!r} to {dst!r}:")
+        pretty_print_path(G, path)
 
     export_leaflet_map(G, out_html="stations_map.html")
