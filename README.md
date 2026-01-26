@@ -256,7 +256,7 @@ GRANT SELECT, INSERT, UPDATE ON dw.fact_movement TO efe;
 
 # Documentation for the python pipeline
 
-## Ingesting station data (`stations.py`)
+## Ingesting station data (`etl/stations.py`)
 
 We parse `stations.json` and iterate over `result` (a list of station objects). For each station:
 - We read the station name (`name`) and its `evaNumbers` array.
@@ -272,7 +272,7 @@ We parse `stations.json` and iterate over `result` (a list of station objects). 
 
 The ingestion is idempotent: on conflict (`station_eva`) we update name/search/coordinates.
 
-## Ingesting train data (`trains.py`)
+## Ingesting train data (`etl/trains.py`)
 
 We iterate over all timetable XML files under `/timetables/**` and extract train identifiers from each `<tl>` element:
 - `tl@c`  $\rightarrow$ `category`
@@ -282,7 +282,7 @@ We iterate over all timetable XML files under `/timetables/**` and extract train
 
 `train_id` is a database-generated surrogate key. We rely on a unique constraint on `(category, train_number)` (`ON CONFLICT DO NOTHING`) and then query `dw.dim_train` to build a mapping `(category, train_number) -> train_id` for fact-table ingestion.
 
-## Ingesting time snapshots (`time_dim.py`)
+## Ingesting time snapshots (`etl/time_dim.py`)
 
 We derive time-dimension rows from the snapshot keys encoded in folder names:
 - Timetables: `/timetables/{YYMMDDHH00}/...` (hourly snapshots)
@@ -295,7 +295,7 @@ We discover all snapshot keys (10 digits `YYMMDDHHmm`), parse them into:
 - `hour`, `minute`
 We upsert into `dw.dim_time` on conflict (`snapshot_key`) to keep the pipeline idempotent.
 
-## Ingesting planned movements (`fact_planned.py`)
+## Ingesting planned movements (`etl/fact_planned.py`)
 
 We ingest the "planned" schedule snapshots from `/timetables` and write them into `dw.fact_movement`. For each snapshot folder (`snapshot_key = YYMMDDHHmm`):
 - We iterate over all station XML files in that snapshot and parse the root element.
@@ -334,7 +334,7 @@ The ingestion is idempotent: on conflict (`snapshot_key, station_eva, stop_id`) 
 
 
 
-## Ingesting timetable updates (`fact_changed.py`)
+## Ingesting timetable updates (`etl/fact_changed.py`)
 
 After the planned baseline is loaded from `/timetables`, we ingest incremental updates from `/timetable_changes`. Each changes snapshot represents the current state at time `snapshot_key = YYMMDDHHmm`. The goal is to create a new fact row for that snapshot by copying the latest known planned context for the same stop and then applying any updates (delay, cancellation, path change).
 
