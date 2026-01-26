@@ -5,7 +5,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType, IntegerType
 from pyspark.sql import functions as sf
 from pyspark.sql.window import Window
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator
 
 # ---------- snapshot discovery ----------
 # SAME FUNCTION as in fact_planned, fact_changes -> need to create utils for re-used stuff
@@ -25,15 +25,6 @@ def iter_timetable_snapshots(timetables_root: str = "timetables") -> Iterator[st
 
 def timetables_glob_for_snapshot(snapshot_key: str, timetables_root: str = "timetables") -> str:
     return os.path.join(timetables_root, "**", snapshot_key, "*.xml")
-
-
-def has_xml_files(dir_path: str) -> bool:
-    """
-    True если в папке (рекурсивно) есть хотя бы один .xml
-    """
-    pattern = os.path.join(dir_path, "**", "*.xml")
-    return bool(glob.glob(pattern, recursive=True))
-
 
 # ---------- snapshot discovery ----------
 
@@ -99,27 +90,6 @@ def get_last_values_for_stop(df, orderCol, keys, cols=None):
 def get_non_key_cols(df, keys):
     return [c for c in df.columns if c not in keys]
 
-def list_snapshot_dirs(spark, base_path: str) -> List[str]:
-    """
-    Lists immediate child directories of base_path via Hadoop FS.
-    IMPORTANT: base_path must NOT contain glob '*'.
-    """
-    jvm = spark._jvm
-    conf = spark._jsc.hadoopConfiguration()
-    fs = jvm.org.apache.hadoop.fs.FileSystem.get(conf)
-    Path = jvm.org.apache.hadoop.fs.Path
-
-    p = Path(base_path)
-    if not fs.exists(p):
-        return []
-
-    statuses = fs.listStatus(p)
-    out = []
-    for st in statuses:
-        if st.isDirectory():
-            out.append(st.getPath().toString().rstrip("/"))
-    return sorted(out)
-
 def basename(path: str) -> str:
     return path.rstrip("/").split("/")[-1]
 
@@ -133,7 +103,7 @@ def main():
 
     print(f"Amount of keys planned: {len(snapshot_keys_planned)}")
     print(f"Amount of keys changes: {len(snapshot_keys_changes)}")
-    print(f"Amount of keys changes: {len(all_snapshot_keys)}")
+    print(f"Amount of keys together: {len(all_snapshot_keys)}")
 
     out_all_logs = '/opt/spark-data/logs'
 
