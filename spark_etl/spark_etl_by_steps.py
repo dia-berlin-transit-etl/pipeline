@@ -111,7 +111,7 @@ def main():
     StructField("id", StringType(), False),
     StructField("tl", StructType([
         StructField("n", IntegerType(), False),
-        StructField("o", StringType(), False)
+        StructField("c", StringType(), False)
     ]), True),
 
     StructField("ar", StructType([
@@ -127,7 +127,7 @@ def main():
         StructField("eva", IntegerType(), False),
         StructField("tl", StructType([
             StructField("n", IntegerType(), False),
-            StructField("o", StringType(), False)
+            StructField("c", StringType(), False)
         ]), True),
 
         StructField("ar", StructType([
@@ -152,7 +152,7 @@ def main():
     flatten_mapping_planned_fields = {
         "id": 'stop_id',
         "tl.n": "train_number",
-        "tl.o":"train_owner",
+        "tl.c":"train_category",
         "ar.pt":"arr_pt_raw",
         "dp.pt":"dep_pt_raw",
         "fileName": "fileName"
@@ -216,8 +216,10 @@ def main():
     order = 'snapshot_ts'
     leftCols = [c for c in events.columns if c not in keys + ["snapshot_date"]]
     movementDf = get_last_values_for_stop(events, order, keys, leftCols)
-    movementDf = movementDf.withColumns({"arr_delay_min": sf.when(sf.col("arr_ct").isNotNull() & sf.col("arr_pt").isNotNull(), sf.floor((sf.unix_timestamp("arr_ct") - sf.unix_timestamp("arr_pt")) / 60)),\
-                                         "dep_delay_min": sf.when(sf.col("dep_ct").isNotNull() & sf.col("dep_pt").isNotNull(), sf.floor((sf.unix_timestamp("dep_ct") - sf.unix_timestamp("dep_pt")) / 60))})
+    movementDf = movementDf.withColumns({
+        "arr_delay_min": sf.when(sf.col("arr_pt").isNull(), None).when(sf.col("arr_ct").isNotNull(), sf.floor((sf.unix_timestamp("arr_ct") - sf.unix_timestamp("arr_pt")) / 60)).otherwise(0),\
+        "dep_delay_min": sf.when(sf.col("dep_pt").isNull(), None).when(sf.col("dep_ct").isNotNull(), sf.floor((sf.unix_timestamp("dep_ct") - sf.unix_timestamp("dep_pt")) / 60)).otherwise(0)
+        })
 
     movementDf.printSchema()
     path_to_parquet = "/opt/spark-data/movements"
