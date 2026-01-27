@@ -21,50 +21,14 @@ The folders `/timetable` and `/timetable_changes` will be gitignored.
 
 You start from three separate raw components (Stations `.json`, Timetables `.xml`, Timetable Changes `.xml`) and design your own star schema that can represent all of them once ingested.
 
-### Station:
+### `Station.json`:
 
-Must-haves:
+Required fields:
 
 - `name`: station name
-- `evaNumbers`: to tie with the `XML` files. (`XML` should be using `evaNumbers.number`)
-    - Use EVA numbers for `XML` joins.
+- `evaNumbers[].number` where `evaNumbers[].isMain == true`: station EVA number (stable identifier)
+- `evaNumbers[].coordinates[]` where `evaNumbers[].isMain == true`: station coordinates
 
-Nice-to-haves:
-
-- `number`: DB station record id, but the XML is EVA-based, so not our primary join key.
-- `ifopt`: useful as an additional stable identifier and for debugging
-
-This is what we would have with the two must-have params:
-
-```json
-{
-      "name": "Ahrensfelde",
-      "evaNumbers": [
-        {
-          "number": 8011003,
-          "geographicCoordinates": {
-            "type": "Point",
-            "coordinates": [
-              13.565154,
-              52.571375
-            ]
-          },
-          "isMain": true
-        },
-        {
-          "number": 8089188,
-          "geographicCoordinates": {
-            "type": "Point",
-            "coordinates": [
-              13.565551,
-              52.5712445
-            ]
-          },
-          "isMain": false
-        }
-      ],
-}
-```
 
 > [!IMPORTANT]
 > `"isMain": true` means this is the primary one among several identifiers for the same station record. Only consider entries with `true`.
@@ -93,57 +57,24 @@ The root:
 ```
 
 Each `<s>` is one stop (one train calling at this station).
-Example:
 
-```xml
-<s id="5871316147024433626-2509021411-3">
-  <tl f="N" t="p" o="800165" c="RB" n="56935" />
-  <ar pt="2509021420" pp="1" l="23" ppth="Berlin Friedrichstraße|Berlin Alexanderplatz" />
-  <dp pt="2509021421" pp="1" l="23" ppth="Berlin Ostkreuz|Flughafen BER" />
-</s>
-```
+Required fields:
 
 - Stop ID: `5871316147024433626-2509021411-3`
 	- Unique identifier for "this trip at this station (and this stop index)"
 - Train label: `<tl .../>`
-	- `f="N"`: flags (can be ignored)
-	- `t="p"`: trip type (here _planned_)
-	- `o="800165"` operator/owner code
 	- `c="RB"`: category (here _RB_)
 	- `n="56935"`: train number
 	- So train **RB 56935**
 - Arrival event `<ar .../>`
 	- `pt="2509021420"`: planned arrival time = `2025-09-02 14:20`
-	- `pp="1"`: planned platform = `1`
-	- `l="23"`: line indicator (often relevant for S/RB)
-	- `ppth="Berlin Friedrichstraße|Berlin Alexanderplatz"`
+	- `ppth="Berlin Friedrichstraße|Berlin Alexanderplatz"` (pipe separated list)
 		- Stations before the current station, so it came from `Friedrichstrasse -> Alexanderplatz -> Ostbahnhof`
 - Departure event `<dp .../>`
 	- `pt="2509021421"`: planned departure time = `2025-09-02 14:21`
-	- `pp="1"`: planned platform
-	- `l="23"`: line indicator
 	- `ppth="Berlin Ostkreuz|Flughafen BER"`
 		- Stations after the current station, so it goes `Ostbahnhof -> Ostkreuz -> Flughafen BER`
 
-**Safe to ignore:**
-- `tl @f` (flags)
-- `tl @t` (trip type)
-- `tl @o` (operator/owner)
-- `ar/dp @l` (line indicator)
-- `ar/dp @ppth` (path string)
-	- For the last tasks (graph) we'll need "connections/edges", but we can derive edges from other sources (e.g. stop sequences via trip IDs)
-
-**Keep:**
-
-- `s @id` (stop ID)
-    - Best stable key to de-duplicate and join planned vs changes for same stop/event
-- `tl @c` (category) and `tl @n` (train number)
-	- Concatenate them to get the train name.
-	- These could be ignored and the delays/cancellations could still be computed. But they are tiny and useful for debugging ("which train is this?"), so keep.
-- `ar/dp @pt` (planned time)
-	- Must have: Needed for delay computations (changed - planned)
-- `ar/dp @pp` (planned platform)
-	- Not required for core tasks, but cheap to keep and helps sanity-checking.
 
 
 ### Timetable Change
@@ -167,86 +98,80 @@ The root:
 ```
 
 Each `<s>` is one stop (one train calling at this station).
-Example:
-
-```xml
-<s id="-4020550040361167307-2509021345-8" eva="8011160">
-    <m id="r2415041" t="h" from="2505120800" to="2509202359" cat="Information" ts="2505112304" ts-tts="25-09-02 10:48:50.464" pr="3" />
-    <ar ct="2509021817">
-      <m id="r23682215" t="d" c="43" ts="2509021516" ts-tts="25-09-02 15:16:53.743" />
-    </ar>
-    <dp ct="2509021821">
-      <m id="r23682215" t="d" c="43" ts="2509021516" ts-tts="25-09-02 15:16:53.743" />
-    </dp>
-</s>
-```
 
 - Label `<s .../>`
 	- Stop ID: `"5871316147024433626-2509021411-3"`
-		- This is your best key to match the change record to the corresponding planned stop (so you can compare `ct` vs `pt`).
-	- EVA: `"8011160"`
-		- station join key back to `dim_station` and the planned timetable.
-- Label `<m .../>`
-	- `id="r2415041"`
-	- `t="h"`
-	- `from="2505120800"`
-	- `to="2509202359"`
-	- `cat="Information"`
-	- `ts="2505112304"`
-	- `ts-tts="25-09-02 10:48:50.464"`
-	- `pr="3"`
+	- EVA: (may or may not be given)
 - Arrival event `<ar .../>`
-	- `ct="2509021817"`: changed time
-	- Label `<m .../>`
-		- `id="r23682215"`
-		- `t="d"`
-		- `c="43"`
-		- `ts="2509021516"`
-		- `ts-tts="25-09-02 15:16:53.743"`
-			- ignore and rely on the compact `ts` or the snapshot folder time
+	- `ct`: changed time
+    - `cs` (check `schema.json` for params.)
 - Departure event `<dp .../>`
-	- `ct="2509021821"`: changed time
-	- Label `<m .../>`
-		- `id="r23682215"`
-		- `t="d"`
-		- `c="43"`
-		- `ts="2509021516"`
-		- `ts-tts="25-09-02 15:16:53.743"`
-
-**Safe to ignore:**
-- Station-level `<m .../>` directly under `<s>`
- - Event-level `<m .../>` inside `<ar>` / `<dp>`
- - `ts-tts="25-09-02 ..."`
-	- This is a human-friendly timestamp string. You can ignore it and rely on the compact `ts` or your snapshot folder time.
-
-**Keep:**
-- Root `eva="8011160"` (or the stop `eva`)  
-    This is your station join key back to `dim_station` and the planned timetable.
-- Stop `id="…"`  
-    This is your best key to match the change record to the corresponding planned stop (so you can compare `ct` vs `pt`).
-- Event changed time
-    - `ar @ct` and/or `dp @ct`  
-        Needed to compute delay: `delay_minutes = ct - pt`.
-- Event cancellation status if present
-    - In many change files you’ll also see `cs="c"` (cancelled) on `ar`/`dp` (or a related cancellation indicator like `clt`).  
-        That’s what you’ll use for counting cancellations per snapshot.  
-        _(This example doesn’t show `cs`, but it will appear in other records.)_
-- Snapshot timestamp
-    - Not in the XML fields you listed, but you must take it from the folder name (e.g., `2509021600`) because tasks ask "at a time snapshot (date hour)".
+	- `ct`: changed time
+        - Needed to compute delay: `delay_minutes = ct - pt`
+    - `cs` (check `schema.json` for params.)
 
 
-## The Star Schema
 
-Three dimensions and one fact table.
+## Star schema design (DW schema `dw`)
 
-![Schema ERD](schema_erd.png)
+<!-- ![Schema ERD](schema_erd.png) -->
+<img src="schema_erd.png" alt="Schema ERD" width="600" />
 
-## Ingestion:
+
+Our warehouse follows a star-schema layout with one central fact table (`dw.fact_movement`) and three core dimensions (`dw.dim_station`, `dw.dim_train`, `dw.dim_time`). The fact table stores the observed state of train movements per snapshot, while dimensions provide descriptive context for analysis.
+
+### Dimensions
+
+- **`dw.dim_station` (station dimension)**  
+    Stores one row per station, identified by the main EVA number (`station_eva`, primary key). It contains descriptive attributes (`station_name`) and geographical coordinates (`lon`, `lat`). The additional column `station_name_search` is a normalized representation used for fuzzy station name resolution during ingestion (pg_trgm).
+- **`dw.dim_train` (train dimension)**  
+    Stores one row per train identity. It uses a surrogate key (`train_id`) and enforces uniqueness on the natural identifier `(category, train_number)`. This enables grouping and filtering by train category (e.g., S/RE/ICE) and train number.
+- **`dw.dim_time` (snapshot/time dimension)**  
+    Stores one row per snapshot folder (`snapshot_key = YYMMDDHHmm`). Besides the key, it provides derived attributes (`snapshot_ts`, `snapshot_date`, `hour`, `minute`). This dimension represents _observation time_ ("state as-of snapshot"), not the planned/changed event timestamps.
+
+### Fact table
+
+- **`dw.fact_movement` (movement fact table)**  
+    The fact table captures the planned schedule and its incremental updates. Each row represents the state of a single stop (`stop_id`) at a station (`station_eva`) for a given snapshot (`snapshot_key`) and train (`train_id`). Uniqueness is enforced by `(snapshot_key, station_eva, stop_id)`, allowing multiple "as-of" rows for the same stop over time (different snapshots).
+    
+    The fact table contains:
+    - **Keys (foreign keys to dimensions):**
+        - `snapshot_key -> dim_time`
+        - `station_eva -> dim_station`
+        - `train_id -> dim_train`
+    - **Planned attributes (from `/timetables`):**
+        - `planned_arrival_ts`, `planned_departure_ts`
+        - `previous_station_eva`, `next_station_eva`
+    - **Changed attributes (from `/timetable_changes`):**
+        - `changed_arrival_ts`, `changed_departure_ts`
+        - `changed_previous_station_eva`, `changed_next_station_eva`
+    - **Measures used in analysis:**
+        - cancellation flags (`arrival_cancelled`, `departure_cancelled`)
+        - delays (`arrival_delay_min`, `departure_delay_min`)
+        - visibility flags (`arrival_is_hidden`, `departure_is_hidden`)
+    Station references for previous/next and changed previous/next are implemented as additional foreign keys back to `dim_station` (role-playing station relationships).
+    
+
+### Audit tables (supporting ingestion quality)
+
+- **`dw.station_resolve_log`** records every station name resolution attempt (raw string, normalized string, best match, similarity score, and whether it was auto-linked).
+- **`dw.needs_review`** stores unresolved or low-confidence station strings for manual inspection.
+
+These tables are not part of the analytical star schema (and not included in the image above), but support data quality and debugging.
+
+### Indices
+
+- A trigram GIN index on `dim_station.station_name_search` accelerates fuzzy station lookup during ingestion.
+- The composite index `(station_eva, stop_id, snapshot_key DESC)` on `fact_movement` accelerates "latest as-of snapshot" lookups, which are required to chain timetable changes on to the most recent available state.
+
+
+
+## Setup Ingestion:
 
 Create `.pgpass` file such that:
 ```sh
 cat ~/.pgpass
-localhost:5432:public_transport_db:user:password
+localhost:5432:public_transport_db:<user>:<password>
 ```
 
 and give the permissions:
@@ -254,10 +179,32 @@ and give the permissions:
 chmod 600 ~/.pgpass
 ```
 
+Create virtual environment and install requirements:
+
+```sh
+python -m venv .venv
+source .venv/bin/activate
+
+python -m pip install -r requirements.txt
+```
+
+Make the python ingestion script executable:
+```sh
+chmod +x rebuild_and_ingest.sh
+```
+
+Pass your DB username as env. var.:
+```sh
+export DB_USER=<user_name>
+```
+
 Run the script:
 ```sh
-python ingestion.py
+./rebuild_and_ingest.sh
 ```
+
+This script should create the schema and run the python ingestion scripts.
+If there is an error, there might be something lacking with your postgres configuration, for which you can read the below tips.
 
 
 ## Postgres CLI
@@ -304,39 +251,12 @@ GRANT SELECT, INSERT, UPDATE ON dw.dim_time TO efe;
 GRANT SELECT, INSERT, UPDATE ON dw.fact_movement TO efe;
 ```
 
-## Setup
-
-1. **Create and activate a virtual environment**
-
-   ```bash
-   python -m venv venv
-   source venv/bin/activate      # On macOS/Linux
-   venv\Scripts\activate         # On Windows
-   ```
-
-2. **Install dependencies**
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Running the ingestion scripts
-
-Run the scripts in this order:
-
-```sh
-python ingestion.py --step stations
-python ingestion.py --step trains
-python ingestion.py --step time
-python ingestion.py --step planned --snapshot 2509021400 --threshold 0.75
-# python ingestion.py --step changed (coming soon...)
-```
 
 -----
 
 # Documentation for the python pipeline
 
-## Ingesting station data (`stations.py`)
+## Ingesting station data (`etl/stations.py`)
 
 We parse `stations.json` and iterate over `result` (a list of station objects). For each station:
 - We read the station name (`name`) and its `evaNumbers` array.
@@ -352,7 +272,7 @@ We parse `stations.json` and iterate over `result` (a list of station objects). 
 
 The ingestion is idempotent: on conflict (`station_eva`) we update name/search/coordinates.
 
-## Ingesting train data (`trains.py`)
+## Ingesting train data (`etl/trains.py`)
 
 We iterate over all timetable XML files under `/timetables/**` and extract train identifiers from each `<tl>` element:
 - `tl@c`  $\rightarrow$ `category`
@@ -362,7 +282,7 @@ We iterate over all timetable XML files under `/timetables/**` and extract train
 
 `train_id` is a database-generated surrogate key. We rely on a unique constraint on `(category, train_number)` (`ON CONFLICT DO NOTHING`) and then query `dw.dim_train` to build a mapping `(category, train_number) -> train_id` for fact-table ingestion.
 
-## Ingesting time snapshots (`time_dim.py`)
+## Ingesting time snapshots (`etl/time_dim.py`)
 
 We derive time-dimension rows from the snapshot keys encoded in folder names:
 - Timetables: `/timetables/{YYMMDDHH00}/...` (hourly snapshots)
@@ -374,3 +294,343 @@ We discover all snapshot keys (10 digits `YYMMDDHHmm`), parse them into:
 - `snapshot_date` (date)
 - `hour`, `minute`
 We upsert into `dw.dim_time` on conflict (`snapshot_key`) to keep the pipeline idempotent.
+
+## Ingesting planned movements (`etl/fact_planned.py`)
+
+We ingest the "planned" schedule snapshots from `/timetables` and write them into `dw.fact_movement`. For each snapshot folder (`snapshot_key = YYMMDDHHmm`):
+- We iterate over all station XML files in that snapshot and parse the root element.
+- We resolve the station EVA (`station_eva`) for the file using:
+    1. `root@eva` if present, else
+    2. `root@station` (resolved by name), else
+    3. a filename-derived station name.  
+        Name-based resolving uses `pg_trgm` similarity against `dw.dim_station.station_name_search`. Every attempt is logged into `dw.station_resolve_log`, and uncertain matches are written into `dw.needs_review`.
+
+For each `<s>` stop element in the station file:
+- We read `s@id` as `stop_id` (the stop identifier in the dataset).
+- We read the train descriptor from `<tl>`:
+    - `tl@c` $\rightarrow$ `category`
+    - `tl@n` $\rightarrow$ `train_number`  
+        We skip entries where `category == "Bus"`. We map `(category, train_number)` to `train_id` via `dw.dim_train` (creating the train row if missing).
+- We read arrival and departure nodes (if present): `<ar>` and `<dp>`.
+    - We mark an event as hidden if `hi="1"`.
+    - We skip the stop only if both arrival and departure are hidden.  
+        Otherwise we keep the stop and store:
+        - `planned_arrival_ts` from `ar@pt` only if arrival is not hidden
+        - `planned_departure_ts` from `dp@pt` only if departure is not hidden
+        - `arrival_is_hidden`, `departure_is_hidden` flags in the fact row
+- We infer previous/next stations from the path fields:
+    - For the arrival event (if present and not hidden), we use `ar@cpth` else `ar@ppth` and take the last station name in the pipe-separated list as the previous station.
+    - For the departure event (if present and not hidden), we use `dp@cpth` else `dp@ppth` and take the first station name in the pipe-separated list as the next station. 
+        These raw names are resolved to EVA numbers using the same station resolver. If the resolver returns the current `station_eva` as previous/next, we set that value to `NULL` to avoid "previous/next=current" artifacts.
+
+We then upsert one row per `(snapshot_key, station_eva, stop_id)` into `dw.fact_movement`, filling only the planned-related fields:
+- `train_id`, `planned_arrival_ts`, `planned_departure_ts`
+- `previous_station_eva`, `next_station_eva`
+- `arrival_is_hidden`, `departure_is_hidden`
+
+All change-related fields (`changed_*`, cancellation flags, delays) remain at their defaults (`NULL` / `false`) in planned ingestion.
+
+The ingestion is idempotent: on conflict (`snapshot_key, station_eva, stop_id`) we update the planned fields for that snapshot row, so repeated runs do not create duplicates.
+
+
+
+## Ingesting timetable updates (`etl/fact_changed.py`)
+
+After the planned baseline is loaded from `/timetables`, we ingest incremental updates from `/timetable_changes`. Each changes snapshot represents the current state at time `snapshot_key = YYMMDDHHmm`. The goal is to create a new fact row for that snapshot by copying the latest known planned context for the same stop and then applying any updates (delay, cancellation, path change).
+
+### Reading a changes snapshot and resolving station/train IDs
+
+For each station XML file in the snapshot:
+- We resolve the station EVA (`station_eva`) using the same strategy as planned ingestion:
+    1. `root@eva`, else
+    2. `root@station` (name-based resolve), else
+    3. filename-derived station name.  
+        Name resolves are done via `pg_trgm` similarity on `dw.dim_station.station_name_search`, with all attempts logged to `dw.station_resolve_log` and uncertain matches added to `dw.needs_review`.
+        
+For each `<s>` stop element:
+- We read `s@id` as `stop_id`.
+- We read `<tl c="..." n="...">` to obtain `(category, train_number)` and map it to `train_id` (creating the train if missing). We skip `"Bus"`.
+
+### Extracting update signals from `<ar>` and `<dp>`
+
+For the arrival `<ar>` and departure `<dp>` nodes we parse:
+- Changed times
+    - `ar@ct` $\rightarrow$ `changed_arrival_ts`
+    - `dp@ct` $\rightarrow$ `changed_departure_ts`
+- Cancellation state (authoritative signal: `cs`)  
+    We interpret `cs` as the current cancellation status for that event:
+    - `cs = 'c'` $\rightarrow$ cancelled now
+    - `cs = 'p'` or `cs = 'a'` $\rightarrow$ explicitly not cancelled now (e.g. revocation / planned / added)
+    - `cs` missing $\rightarrow$ no update; we will carry forward the previous cancellation state from the base row  
+        We do not treat `clt` as the cancellation state because it can appear in inconsistent combinations (e.g. together with `cs='p'`).
+		**Revoked cancellations:** A previously cancelled event can be revoked by a later update with `cs='p'` (or `cs='a'`). We reset `arrival_cancelled` / `departure_cancelled` back to `false` whenever `cs` indicates a non-cancelled state. If `cs` is missing, we keep (carry forward) the base cancellation flags.
+- Added stops  
+    A stop can exist only in `timetable_changes` (i.e., there is no planned row). We detect such "added" stops if any of:
+    - `ps = 'a'` on `<ar>` or `<dp>`, or
+    - `cs = 'a'` on `<ar>` or `<dp>`, or
+    - the integer suffix of `stop_id` (after the last `-`) is `>= 100`
+- Hidden flags  
+    We read `hi="1"` into `arrival_is_hidden` / `departure_is_hidden` (stored on the as-of row). Unlike planned ingestion, we do not drop the stop unless we decide the stop has no meaningful update signals.
+- Changed path (prev/next)  
+    If a path is present, we prefer `cpth` else `ppth`:
+    - previous station comes from the last station in the arrival path list
+    - next station comes from the first station in the departure path list  
+        These station names are resolved (pg_trgm) and stored as `changed_previous_station_eva` / `changed_next_station_eva` (self-resolves to the current station are nulled).
+
+We keep a stop only if it contains at least one meaningful signal (a changed/planned time, a cancellation signal, a path update, or is detected as an added stop).
+
+### Chaining logic: choose the latest base row for each stop key
+
+A stop is identified across time by `(station_eva, stop_id)`. Because changes arrive in multiple snapshots, we must apply each new snapshot on top of the latest available row (planned or already changed).
+
+For each `(station_eva, stop_id)` observed in the current changes snapshot `S`, we fetch the base row as:
+- base row = the row in `dw.fact_movement` with the same `(station_eva, stop_id)` and the maximum `snapshot_key` such that `snapshot_key <= S`
+
+Later changes snapshots build on the latest known state, not necessarily the original planned snapshot.
+
+### Writing the "as-of" row for snapshot S
+
+For each stop key `(station_eva, stop_id)` we insert a new row at snapshot `S`:
+- Copy planned fields from the base row
+    - `train_id`
+    - `planned_arrival_ts`, `planned_departure_ts`
+    - `previous_station_eva`, `next_station_eva`
+    - `arrival_is_hidden`, `departure_is_hidden` (unless overridden by flags in the change file)
+- Apply updates from the change snapshot
+    - `changed_arrival_ts`, `changed_departure_ts` from `ct`
+    - `arrival_cancelled`, `departure_cancelled`:
+        - if `cs` is present for that event, use it
+        - otherwise carry forward the base row's cancellation state
+    - `arrival_delay_min`, `departure_delay_min`:
+        - computed only when the event is not cancelled, the planned timestamp exists, and the changed timestamp exists
+        - delay = `(changed_ts - planned_ts)` in minutes
+    - optional path update:
+        - `changed_previous_station_eva`, `changed_next_station_eva` from `cpth`/`ppth`
+
+### Handling added stops with no planned base row
+
+If no base row exists for `(station_eva, stop_id)` with `snapshot_key <= S`, we only insert the row if it is detected as an added stop. In that case:
+- We build the planned timestamps from `pt` if available, otherwise leave them `NULL` (and use `ct` as the changed timestamps if present).
+- We require a valid `train_id` from `<tl>` because `fact_movement.train_id` is `NOT NULL`.
+- Cancellation defaults to "not cancelled" unless a `cs='c'` explicitly indicates cancellation.
+- Prev/next station references are derived from the path fields (prefer `cpth`, else `ppth`) and stored both as base prev/next (best available topology) and optionally as changed prev/next.
+
+### Idempotency
+
+Each as-of row is unique by `(snapshot_key, station_eva, stop_id)`. We upsert on this key:
+- If the row already exists for snapshot `S`, we overwrite the changed fields (and keep the planned context for that snapshot row consistent).
+- This makes re-running the changes step safe and repeatable.
+
+This design allows querying a stop's evolution by selecting all rows for the same `(station_eva, stop_id)` ordered by `snapshot_key`, where each row represents the state "as of" that snapshot.
+
+## Appendix: Station name resolution (pg_trgm–based fuzzy matching)
+
+Our raw timetable files reference stations in multiple inconsistent ways (root EVA number, station name strings, or filename-derived names). To map any station mention to the canonical station dimension (`dw.dim_station`), we use a fuzzy-matching resolver based on PostgreSQL trigram similarity (`pg_trgm`).
+
+### Inputs and output
+
+Input to the resolver:
+- `station_raw`: the station string to resolve (e.g., `"Berlin-Charlottenburg"`, `"alexanderplatz"`, `"s_dkreuz"` from filenames, etc.)
+- `snapshot_key`, `source_path`: metadata for auditing/logging
+- `threshold`: similarity cutoff for "auto-linking"
+
+Output:
+- `station_eva` (`BIGINT`) if confidently matched, otherwise `NULL`.
+
+### Normalization (`to_station_search_name()`)
+
+Before matching, we normalize station strings into a searchable form. The goal is to reduce spelling/formatting noise so that fuzzy matching is robust.
+
+Normalization steps (in order):
+- lowercasing + trimming
+- German character folding:
+    - `ß -> s`, `ä -> a`, `ö -> o`, `ü -> u`
+- special handling for underscores inside words (used as umlaut placeholders in filenames):
+    - `s_d → sd` (underscore removed only when between word characters)
+- expand/normalize common abbreviations:
+    - `hbf -> hauptbahnhof`
+    - `bf -> bahnhof` (excluding "hbf")
+    - `str -> strase` and joining patterns like `"osdorfer strase" -> "osdorferstrase"`
+- drop the token `"berlin"` (so `"Berlin Gesundbrunnen"` matches `"Gesundbrunnen"`)
+- replace all remaining non-alphanumeric characters with spaces
+- collapse multiple spaces
+
+The resulting string is stored in:
+- `dw.dim_station.station_name_search` (for canonical stations from `stations.json`)
+- `station_search_full` (for each resolution attempt)
+
+### Core-token filtering (avoid matching on generic words)
+
+Some tokens occur in many station names and are not helpful for matching (e.g., `"bahnhof"`, `"hauptbahnhof"`, `"station"`, `"sbahn"`, `"ubahn"`). We define a small set of generic tokens and build a "core token list":
+- Split `station_search_full` into tokens
+- Keep only tokens with length $\geq$ 2
+- Drop tokens in the `GENERIC` set
+
+If we have at least one core token, we build:
+- `score_query = " ".join(core_tokens)` (or fall back to full normalized string if core tokens are empty)
+- `core_pat` = a word-boundary regex matching any core token, e.g. `\m(token1|token2)\M`
+
+This reduces false positives where the similarity score is high only because of generic words.
+
+### Fuzzy matching query (pg_trgm)
+
+We select the single best candidate station from `dw.dim_station` using pg_trgm:
+- If `core_pat` exists, we restrict candidates to those containing at least one core token.
+- If core tokens are empty (rare), we scan without the regex restriction.
+
+### Auto-link decision (threshold + fallback rule)
+
+After retrieving the best candidate `(best_station_eva, best_score)`:
+- If we have core tokens:
+    - auto-link if `best_score >= threshold` (e.g., `0.52` in our runs)
+- If we do not have core tokens:
+    - auto-link only if `best_score >= 0.72` (stricter fallback to avoid generic matches)
+
+If auto-linking fails, the resolver returns `NULL`.
+
+### Auditing and manual review support
+
+Every resolution attempt is recorded in `dw.station_resolve_log`:
+- `snapshot_key`, `source_path`
+- `station_raw`, `station_search` (normalized)
+- best candidate EVA/name, best score
+- `auto_linked` boolean
+
+If auto-linking fails or is borderline, we also upsert into `dw.needs_review` keyed by `station_search`, storing:
+- best candidate and score
+- last snapshot where it was seen
+- last source file
+
+This lets us inspect unresolved or ambiguous station names and improve normalization or station data if needed.
+
+### Where station strings come from in the pipeline
+
+The resolver is used in three places:
+1. Station file identity (`station_eva`)
+	- Prefer `root@eva`
+	- Else resolve `root@station`
+	- Else resolve filename-derived station string
+
+2. Path-based neighboring stations (prev/next)
+	- From `ppth`/`cpth` lists in `<ar>` / `<dp>`:
+	    - previous station from arrival path (last element)
+	    - next station from departure path (first element)
+
+3. Changes path updates
+	- Same path logic, stored in `changed_previous_station_eva` / `changed_next_station_eva`
+
+In all cases, the same normalization + pg_trgm matching + auditing logic is applied, so station identity is consistent across planned and changes ingestion.
+
+
+## Task 2: SQL Queries
+
+### 2.1
+
+```sql
+SELECT station_eva, station_name, lon, lat
+FROM dw.dim_station
+WHERE station_name = '...';
+```
+
+We store coordinate information in the table `dim_station` as `lon` and `lat`, which makes it straightforward to return these. `station_eva` is returned as well which is the primary key to the table `dim_station`.
+
+### 2.2
+
+```sql
+PREPARE get_closest_station(double precision, double precision) AS
+SELECT station_eva, station_name, lon, lat
+FROM dw.dim_station
+ORDER BY (
+  power(lat - $1, 2) +
+  power((lon - $2) * cos(radians($1)), 2)
+)
+LIMIT 1;
+```
+
+We select the same fields as the previous task and we order them by measuring the euclidian distance of the _equirectangular approximation_ of the coordinates. We return the top row with `LIMIT 1`.
+
+### 2.3
+
+```sql
+WITH params AS (
+  SELECT '...'::text AS s  -- snapshot S
+),
+latest AS (
+  SELECT DISTINCT ON (fm.station_eva, fm.stop_id)
+    fm.station_eva,
+    fm.stop_id,
+    fm.train_id,
+    fm.arrival_cancelled,
+    fm.departure_cancelled
+  FROM dw.fact_movement fm
+  JOIN params p ON true
+  WHERE fm.snapshot_key <= p.s
+  ORDER BY fm.station_eva, fm.stop_id, fm.snapshot_key DESC, fm.movement_key DESC
+),
+canceled_station_train AS (
+  SELECT DISTINCT
+    station_eva,
+    train_id
+  FROM latest
+  WHERE arrival_cancelled OR departure_cancelled
+)
+SELECT
+  COUNT(*) AS cancellations_per_station_total
+FROM canceled_station_train;
+
+```
+
+To count cancellations at a given snapshot cutoff `S`, we treat `dw.fact_movement` as an "as-of" fact table and first restrict rows to `snapshot_key <= S`. Because each stop `(station_eva, stop_id)` can appear in multiple snapshots (planned baseline plus later updates), we select the most recent row per movement using `DISTINCT ON ... ORDER BY snapshot_key DESC`. We then keep only rows where either `arrival_cancelled` or `departure_cancelled` is true. To follow the requirement "count a train cancelled once per station", we deduplicate by `(station_eva, train_id)` and finally count these distinct station-train pairs. This yields the number of trains that are cancelled at each station according to the latest available state up to snapshot `S`.
+
+### 2.4
+
+```sql
+WITH st AS (
+  SELECT station_eva, station_name
+  FROM dw.dim_station
+  WHERE station_name = '...'  -- input station name
+),
+
+latest AS (
+  SELECT DISTINCT ON (fm.station_eva, fm.stop_id)
+    fm.station_eva,
+    fm.stop_id,
+    fm.arrival_delay_min,
+    fm.departure_delay_min,
+    fm.arrival_cancelled,
+    fm.departure_cancelled,
+    fm.arrival_is_hidden,
+    fm.departure_is_hidden
+  FROM dw.fact_movement fm
+  JOIN st ON st.station_eva = fm.station_eva
+  ORDER BY fm.station_eva, fm.stop_id, fm.snapshot_key DESC, fm.movement_key DESC
+),
+
+delay_obs AS (
+  SELECT arrival_delay_min AS delay_min
+  FROM latest
+  WHERE arrival_delay_min IS NOT NULL
+    AND arrival_delay_min >= 0
+    AND arrival_cancelled = FALSE
+    AND arrival_is_hidden = FALSE
+
+  UNION ALL
+
+  SELECT departure_delay_min AS delay_min
+  FROM latest
+  WHERE departure_delay_min IS NOT NULL
+    AND departure_delay_min >= 0
+    AND departure_cancelled = FALSE
+    AND departure_is_hidden = FALSE
+)
+SELECT
+  st.station_name,
+  st.station_eva,
+  AVG(delay_min)::double precision AS avg_delay_min,
+  COUNT(*) AS n_delay_observations
+FROM delay_obs
+JOIN st ON true
+GROUP BY st.station_name, st.station_eva;
+```
+
+To compute the average delay for a station, we first resolve the station name to its `station_eva` in `dw.dim_station`. Since `dw.fact_movement` stores multiple "as-of" rows over time for the same stop, we collapse the timeline by selecting the most recent row per movement key `(station_eva, stop_id)` using `DISTINCT ON ... ORDER BY snapshot_key DESC`. From these latest rows, we extract delay observations from both arrival and departure (`arrival_delay_min`, `departure_delay_min`) and union them into a single stream of numbers. We exclude invalid observations by filtering out `NULL` delays, negative delays, cancelled events, and hidden events. Finally, we compute `AVG(delay_min)` and report the number of included observations as a sanity check.
