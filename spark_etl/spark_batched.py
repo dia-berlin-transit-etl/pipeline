@@ -13,6 +13,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("spark_etl")
 
+
+def test_distributed_write(spark, path):
+    log.info("Running preflight distributed write test to %s", path)
+    test_df = spark.range(0, 100).repartition(4)  # force multiple executors
+    test_path = f"{path}/_spark_write_test"
+
+    try:
+        test_df.write.mode("overwrite").parquet(test_path)
+        spark.read.parquet(test_path).count()  # verify readable
+        log.info("Preflight write test succeeded")
+    except Exception as e:
+        log.error("Preflight write test FAILED: %s", e)
+        raise
+
+
 # ==================== SCHEMAS (Task 3.1) ====================
 # Raw column names use the XML attribute names (pt, ct, ps, cs, hi)
 # to stay close to the source format.  Derived columns after transform
@@ -412,6 +427,7 @@ def main():
         .getOrCreate()
     )
 
+    test_distributed_write(spark, "file:///opt/spark-data/movements")
     t0 = time.time()
 
     # --- Task 3.1: Extract & Transform ---
@@ -429,7 +445,6 @@ def main():
     log.info("Backfilling station EVA on timetables...")
     timetable_df = backfill_station_eva(timetable_df, changes_df)
 
-
     log.info("Transforming...")
     timetable_df = cast_timestamps(timetable_df, ["ar_pt", "dp_pt"])
     changes_df = derive_change_flags(
@@ -437,7 +452,7 @@ def main():
     )
 
     # --- Task 3.1: Load ---
-    
+
     log.info("Writing timetables parquet...")
     t1 = time.time()
     timetable_df.write.partitionBy("snapshot_key").mode("overwrite").parquet(
@@ -452,6 +467,7 @@ def main():
     )
     log.info("Changes parquet written (%.1fs)", time.time() - t1)
     log.info("Task 3.1 ETL complete (%.1fs total)", time.time() - t0)
+
 
     # --- Verify ---
     tt = spark.read.parquet("file:///opt/spark-data/movements/timetables")
@@ -473,7 +489,9 @@ def main():
     # TODO: should be over a time window for a specific station, add station name to eva mapping
     log.info("Task 3.2 – Computing average daily delay per station...")
     t1 = time.time()
-    avg_delay = compute_average_daily_delay(resolved, start_date="2023-01-01", end_date="2023-01-31", station_eva=1100001)
+    avg_delay = compute_average_daily_delay(
+        resolved, start_date="2025-10-04", end_date="2025-10-07", station_eva=8011162
+    )
     avg_delay.show(10)
     log.info("Task 3.2 complete (%.1fs)", time.time() - t1)
 
