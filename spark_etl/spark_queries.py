@@ -2,9 +2,10 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as sf
 
 def get_daily_delay_averages(df, station):
+    # station = to_station_search_name(station)
     daily_delays = df.filter(sf.col('station') == station)\
-        .filter(((sf.col('arr_delay_min') >= 0) & (~sf.col('arr_cancelled')) & (~sf.col('arr_hi'))) | \
-                ((sf.col('dep_delay_min') >= 0) & (~sf.col('dep_cancelled')) & (~sf.col('dep_hi')))) \
+        .filter(((sf.col('arr_delay_min').isNotNull()) & (sf.col('arr_delay_min') >= 0) & (~sf.col('arr_cancelled')) & (~sf.col('arr_hi'))) | \
+                ((sf.col('dep_delay_min').isNotNull()) & (sf.col('dep_delay_min') >= 0) & (~sf.col('dep_cancelled')) & (~sf.col('dep_hi')))) \
         .fillna(0, subset=['arr_delay_min', 'dep_delay_min']) \
         .withColumn('delay_min', sf.col('arr_delay_min') + sf.col('dep_delay_min')) \
         .groupBy('snapshot_date').avg('delay_min').withColumnRenamed('avg(delay_min)', 'delay_average')
@@ -19,7 +20,7 @@ def get_avg_daily_delay(df, station):
 def get_avg_number_train_dep(df):
     stations = df.select('station').distinct()
 
-    df = df.filter((~sf.col('dep_cancelled')) & (~sf.col('dep_hi')) & (sf.col('dep_pt').isNotNull())) \
+    df = df.filter((~sf.col('dep_cancelled')) & (~sf.col('dep_hi')) & (sf.col('dep_pt').isNotNull()) & (~sf.lower(sf.col('train_category')).contains('bus'))) \
         .dropDuplicates(['stop_id', 'station', 'dep_pt']) \
         .withColumn('actual_dep', sf.when(sf.col('dep_ct').isNotNull(), sf.col('dep_ct')).otherwise(sf.col('dep_pt'))) \
         .withColumns({'actual_dep_hour': sf.hour(sf.col('actual_dep')), 'actual_dep_day': sf.to_date(sf.col('actual_dep'))})
