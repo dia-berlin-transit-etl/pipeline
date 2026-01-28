@@ -2,7 +2,7 @@ from pyspark.sql import SparkSession, functions as F
 
 spark = SparkSession.builder.appName("Station JSON -> dim_station parquet").getOrCreate()
 
-station_json_path = "./DBahn-berlin/station_data.json"
+station_json_path = "./station_data.json"
 out_parquet_path = "./spark-data/dim_station"
 
 raw = spark.read.option("multiLine", True).json(station_json_path)
