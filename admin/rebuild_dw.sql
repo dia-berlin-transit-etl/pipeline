@@ -5,11 +5,11 @@
 
 DROP SCHEMA IF EXISTS dw CASCADE;
 
-\i schema.sql
-
 -- extensions
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
+
+\i schema.sql
 
 -- If dw_user is the same role running this script, these are harmless but redundant.
 GRANT USAGE ON SCHEMA dw TO :dw_user;
