@@ -50,7 +50,7 @@ def main() -> None:
     try:
         with conn.cursor() as cur:
             if args.step == "stations":
-                n = upsert_dim_station_from_json(cur, "DBahn-berlin/station_data.json")
+                n = upsert_dim_station_from_json(cur, "./station_data.json")
                 conn.commit()
 
                 print(f"Upserted station rows (attempted): {n}")
