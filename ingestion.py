@@ -5,6 +5,8 @@ import re
 
 import psycopg2
 
+from postgres_connector import PostgresConnector
+
 from etl.stations import upsert_dim_station_from_json, print_dim_station_preview
 from etl.trains import upsert_dim_train_from_timetables
 from etl.time_dim import upsert_dim_time_from_paths, print_dim_time_preview
@@ -15,14 +17,7 @@ from etl.fact_changed import upsert_fact_movement_from_all_timetable_changes
 
 
 def get_conn():
-    return psycopg2.connect(
-        host="localhost",
-        port=5432,
-        dbname="public_transport_db",
-        user="efe",
-        # no password -> libpq will use ~/.pgpass if it matches
-    )
-
+    return PostgresConnector().connect()
 
 _SNAPSHOT_KEY_RE = re.compile(r"^\d{10}$")
 
