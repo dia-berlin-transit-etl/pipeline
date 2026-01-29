@@ -1,35 +1,33 @@
 #!/usr/bin/env bash
 
 
-# make it executable and run it
-# chmod +x rebuild_and_ingest.sh
-# docker compose up -d
+# Make it executable: chmod +x rebuild_and_ingest.sh
+# export DB_USER=<user_name>
 # ./rebuild_and_ingest.sh
 
 set -euo pipefail
 
-# config (env overrides)
-DB_HOST="${DB_HOST:-localhost}"
-DB_PORT="${DB_PORT:-5434}"
-DB_NAME="${DB_NAME:-db_berlin}"
-DB_USER="${DB_USER:-dia_user}"
-DB_PASSWORD="${DB_PASSWORD:-dia}"
+# -------- config (env overrides) --------
+DB_NAME="${DB_NAME:-public_transport_db}"
+: "${DB_USER:?DB_USER is required (e.g., export DB_USER=...)}"
 
+# paths
 SQL_REBUILD="${SQL_REBUILD:-admin/rebuild_dw.sql}"
 
-echo "== Rebuild DW schema in DB '${DB_NAME}' on ${DB_HOST}:${DB_PORT} as '${DB_USER}' =="
+echo "== Rebuild DW schema in DB '${DB_NAME}' for user '${DB_USER}' =="
 
-# Run the SQL rebuild script against the Docker Postgres
-PGPASSWORD="$DB_PASSWORD" psql \
-  "host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER}" \
+# 1) Rebuild schema + extensions + grants (runs as postgres)
+echo "-- Dropping/recreating schema + extensions + grants..."
+sudo -u postgres psql -d "$DB_NAME" \
   -v "dw_user=${DB_USER}" \
   -f "$SQL_REBUILD"
 
 echo "== Running ingestion steps =="
+# 2) Run ingestion scripts as the current shell user (uses ~/.pgpass)
 python ingestion.py --step stations
 python ingestion.py --step trains
 python ingestion.py --step time
-python ingestion.py --step planned --threshold 0.52
-python ingestion.py --step changed --threshold 0.52
+python ingestion.py --step planned --threshold 0.52 # --snapshot 2509021400
+python ingestion.py --step changed --threshold 0.52 # --snapshot 2509021400
 
 echo "== Done =="
