@@ -122,12 +122,12 @@ def compute_peak_hour_departure_counts(resolved_df):
     No direct counterpart in fact_planned.py / fact_changed.py (query-only logic).
     """
     stations = resolved_df.select('station_eva').distinct()
-    peak = resolved_df.filter(
+    df = resolved_df.filter(
         sf.col("actual_departure_ts").isNotNull()
         & ~sf.col("departure_cancelled")
         & ~sf.col("departure_is_hidden")) \
         .withColumns({'actual_dep_hour': sf.hour(sf.col('actual_departure_ts')), 'actual_dep_day': sf.to_date(sf.col('actual_departure_ts'))})
-    dep_days = resolved_df.select('actual_dep_day').distinct()
+    dep_days = df.select('actual_dep_day').distinct()
     all_dep_and_station_pairs = stations.crossJoin(dep_days)
     departures_by_peak_hours = df.filter(sf.col('actual_dep_hour').isin([7,8,17,18]))
     departures_by_peak_hours = departures_by_peak_hours.groupBy('station_eva', 'actual_dep_day').count().withColumnRenamed('count', 'dep_count')
