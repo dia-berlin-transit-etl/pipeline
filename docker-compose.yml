@@ -38,7 +38,8 @@ services:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
-      - ./station_data.json:/opt/spark-data/station_data.json:ro
+      - ./DBahn-berlin:/opt/spark-data/DBahn-berlin=======
+      #- ./station_data.json:/opt/spark-data/station_data.json:ro
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
     command: >
@@ -59,7 +60,8 @@ services:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
-      - ./station_data.json:/opt/spark-data/station_data.json:ro
+      - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
+      #- ./station_data.json:/opt/spark-data/station_data.json:ro
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
     command: >
