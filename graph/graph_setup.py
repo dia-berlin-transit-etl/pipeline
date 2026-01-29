@@ -2,15 +2,10 @@ import psycopg2
 import networkx as nx
 import folium
 
+from postgres_connector import PostgresConnector
 
 def get_conn():
-    return psycopg2.connect(
-        host="localhost",
-        port=5432,
-        dbname="public_transport_db",
-        user="efe",
-    )
-
+    return PostgresConnector().connect()
 
 def load_station_nodes(G: nx.Graph, conn) -> int:
     with conn.cursor() as cur:

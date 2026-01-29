@@ -38,7 +38,8 @@ services:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
-      - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
+      - ./DBahn-berlin:/opt/spark-data/DBahn-berlin=======
+      #- ./station_data.json:/opt/spark-data/station_data.json:ro
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
     command: >
@@ -52,14 +53,15 @@ services:
     depends_on:
       - spark-master
     environment:
-      - SPARK_WORKER_CORES=2 # Adjust based on your CPU
-      - SPARK_WORKER_MEMORY=2G # Adjust based on your RAM
+      - SPARK_WORKER_CORES=8                        # machine has a total of 16
+      - SPARK_WORKER_MEMORY=20G                     # machine has 32GB
       - SPARK_SUBMIT_OPTS=-Divy.home=/opt/spark/work-dir/.ivy2
     volumes:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
       - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
+      #- ./station_data.json:/opt/spark-data/station_data.json:ro
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
     command: >
