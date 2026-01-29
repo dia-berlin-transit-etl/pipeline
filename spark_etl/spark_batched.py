@@ -554,15 +554,25 @@ def resolve_latest_stop_state(timetable_df, changes_df):
         .drop("_rn")
     )
 
+    # CORRECTION: dropDuplicates was non-deterministic so I'm switching to window ordering like efe's
+    w_planned = Window.partitionBy("station_eva", "stop_id").orderBy(
+        sf.desc("snapshot_key")
+    )
+
     planned = (
-        timetable_df
-        .select(
-            "station_eva", "stop_id", "station_name",
-            "category", "train_number",
+        timetable_df.select(
+            "station_eva",
+            "stop_id",
+            "station_name",
+            "category",
+            "train_number",
+            sf.col("snapshot_key"),  # for window ordering
             sf.col("dp_pt").alias("planned_departure_ts"),
             sf.col("ar_pt").alias("planned_arrival_ts"),
         )
-        .dropDuplicates(["station_eva", "stop_id"])
+        .withColumn("_rn", sf.row_number().over(w_planned))
+        .filter(sf.col("_rn") == 1)
+        .drop("_rn", "snapshot_key")
     )
 
     changed = latest_changes.select(
@@ -753,7 +763,6 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
     log.info("Changes parquet written (%.1fs)", time.time() - t1)
     log.info("Task 3.1 ETL complete (%.1fs total)", time.time() - t0)
 
-
     # --- Verify ---
     tt = spark.read.parquet("file:///opt/spark-data/movements/timetables")
     ch = spark.read.parquet("file:///opt/spark-data/movements/changes")
@@ -786,6 +795,25 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
     peak_counts = compute_peak_hour_departure_counts(resolved)
     peak_counts.show(10)
     log.info("Task 3.3 complete (%.1fs)", time.time() - t1)
+
+    # CORRECTION: writing final output with snapshot_date partition
+    log.info("Writing final resolved movements to Parquet...")
+    t_write = time.time()
+
+    final_output = resolved.withColumn(
+        "snapshot_date",
+        sf.to_date(
+            sf.coalesce(sf.col("actual_departure_ts"), sf.col("planned_departure_ts"))
+        ),
+    )
+
+    (
+        final_output.repartition("snapshot_date")
+        .write.mode("overwrite")
+        .partitionBy("snapshot_date")
+        .parquet("file:///opt/spark-data/movements/final_movements")
+    )
+    log.info("Final movements written (%.1fs)", time.time() - t_write)
 
     resolved.unpersist()
     log.info("All tasks complete (%.1fs wall time)", time.time() - t0)
