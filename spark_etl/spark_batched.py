@@ -85,24 +85,26 @@ CHANGES_SCHEMA = StructType(
 
 # Schema for the final resolved movement data (one row per stop_id, station_eva)
 # This is the output of resolve_latest_stop_state() written to final_movements parquet
-MOVEMENT_SCHEMA = StructType([
-    StructField("station_eva", LongType()),
-    StructField("stop_id", StringType()),
-    StructField("station_name", StringType()),
-    StructField("category", StringType()),
-    StructField("train_number", StringType()),
-    StructField("planned_arrival_ts", TimestampType()),
-    StructField("planned_departure_ts", TimestampType()),
-    StructField("changed_arrival_ts", TimestampType()),
-    StructField("changed_departure_ts", TimestampType()),
-    StructField("actual_arrival_ts", TimestampType()),
-    StructField("actual_departure_ts", TimestampType()),
-    StructField("arrival_cancelled", BooleanType()),
-    StructField("departure_cancelled", BooleanType()),
-    StructField("arrival_is_hidden", BooleanType()),
-    StructField("departure_is_hidden", BooleanType()),
-    StructField("snapshot_date", DateType()),  # partition column
-])
+MOVEMENT_SCHEMA = StructType(
+    [
+        StructField("snapshot_key", StringType()),
+        StructField("station_eva", LongType()),
+        StructField("stop_id", StringType()),
+        StructField("station_name", StringType()),
+        StructField("category", StringType()),
+        StructField("train_number", StringType()),
+        StructField("planned_arrival_ts", TimestampType()),
+        StructField("planned_departure_ts", TimestampType()),
+        StructField("changed_arrival_ts", TimestampType()),
+        StructField("changed_departure_ts", TimestampType()),
+        StructField("actual_arrival_ts", TimestampType()),
+        StructField("actual_departure_ts", TimestampType()),
+        StructField("arrival_cancelled", BooleanType()),
+        StructField("departure_cancelled", BooleanType()),
+        StructField("arrival_is_hidden", BooleanType()),
+        StructField("departure_is_hidden", BooleanType()),
+    ]
+)
 
 # ==================== PARSING (Task 3.1 – Extract) ====================
 # Each parser runs inside mapPartitions: one task per batch of XMLs, not
@@ -132,96 +134,6 @@ def to_station_search_name(name: str) -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
-
-def levenshtein_distance(s1: str, s2: str) -> int:
-    """Calculate Levenshtein (edit) distance between two strings.
-
-    This respects character order and measures the minimum number of
-    single-character edits (insertions, deletions, substitutions)
-    needed to transform s1 into s2.
-
-    Returns the edit distance (0 = identical).
-    """
-    if not s1:
-        return len(s2) if s2 else 0
-    if not s2:
-        return len(s1)
-
-    # Normalize both strings first
-    s1 = to_station_search_name(s1)
-    s2 = to_station_search_name(s2)
-
-    if s1 == s2:
-        return 0
-
-    len1, len2 = len(s1), len(s2)
-
-    # Use two rows instead of full matrix for memory efficiency
-    prev_row = list(range(len2 + 1))
-    curr_row = [0] * (len2 + 1)
-
-    for i in range(1, len1 + 1):
-        curr_row[0] = i
-        for j in range(1, len2 + 1):
-            cost = 0 if s1[i - 1] == s2[j - 1] else 1
-            curr_row[j] = min(
-                prev_row[j] + 1,      # deletion
-                curr_row[j - 1] + 1,  # insertion
-                prev_row[j - 1] + cost  # substitution
-            )
-        prev_row, curr_row = curr_row, prev_row
-
-    return prev_row[len2]
-
-
-def normalized_edit_distance(name1: str, name2: str) -> float:
-    """Calculate normalized edit distance between two station names.
-
-    Normalizes by the length of the longer string to get a value between 0 and 1.
-    0.0 = identical, 1.0 = completely different.
-
-    This respects word order unlike token set distance.
-    """
-    if not name1 or not name2:
-        return 1.0  # Maximum distance for empty strings
-
-    s1 = to_station_search_name(name1)
-    s2 = to_station_search_name(name2)
-
-    if not s1 or not s2:
-        return 1.0
-
-    if s1 == s2:
-        return 0.0
-
-    dist = levenshtein_distance(s1, s2)
-    max_len = max(len(s1), len(s2))
-
-    return dist / max_len if max_len > 0 else 0.0
-
-
-def token_jaccard_similarity(name1: str, name2: str) -> float:
-    """Calculate Jaccard similarity between token sets of two station names.
-
-    Jaccard = |intersection| / |union|
-    Returns value between 0.0 (no overlap) and 1.0 (identical).
-
-    Used as a secondary metric after edit distance to break ties.
-    """
-    if not name1 or not name2:
-        return 0.0
-
-    tokens1 = set(to_station_search_name(name1).split())
-    tokens2 = set(to_station_search_name(name2).split())
-
-    if not tokens1 or not tokens2:
-        return 0.0
-
-    intersection = len(tokens1.intersection(tokens2))
-    union = len(tokens1.union(tokens2))
-
-    return intersection / union if union > 0 else 0.0
 
 
 def create_station_lookup_df(spark, station_data_path):
@@ -424,132 +336,197 @@ def cast_timestamps(df, columns):
     return df.withColumn("snapshot_ts", sf.to_timestamp("snapshot_key", "yyMMddHHmm"))
 
 
-def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=0.3):
-    """Backfill missing station_eva on timetable rows using DataFrame joins.
+def backfill_station_eva(timetable_df, station_lookup_df, similarity_threshold=0.5):
+    """Backfill missing station_eva on timetable rows using name matching.
 
-    Uses a two-stage lookup strategy:
-    1. Exact match: normalized station name matching
-    2. Fuzzy match: Edit distance (Levenshtein) + Jaccard similarity
-       - Primary: Normalized edit distance (respects character/word order)
-       - Secondary: Jaccard similarity on tokens (for tie-breaking)
+    Uses normalized station name with a two-stage matching strategy:
+    1. Exact match on normalized name
+    2. Fuzzy match using Levenshtein similarity (score >= threshold)
 
     Args:
         timetable_df: DataFrame with timetable records (may have null station_eva)
         station_lookup_df: DataFrame with (search_name, ref_station_eva) from station_data.json
-        fuzzy_threshold: Maximum normalized edit distance for fuzzy match (default: 0.3 = 30% different)
+        similarity_threshold: Minimum similarity score for fuzzy match (default 0.5)
 
     Returns:
         DataFrame with station_eva backfilled where possible
     """
-    from pyspark.sql.types import DoubleType
+    if station_lookup_df is None:
+        log.warning("No station lookup table provided, skipping backfill")
+        return timetable_df
 
+    # Use the same UDF as create_station_lookup_df for consistent normalization
     _search_name_udf = sf.udf(to_station_search_name, StringType())
-    _edit_distance_udf = sf.udf(normalized_edit_distance, DoubleType())
-    _jaccard_udf = sf.udf(token_jaccard_similarity, DoubleType())
 
-    # Add normalized search_name column to timetable
-    result_df = timetable_df.withColumn("search_name", _search_name_udf("station_name"))
-
-    # Rename lookup columns to avoid ambiguity after join
-    lookup_renamed = station_lookup_df.withColumnRenamed(
-        "search_name", "ref_search_name"
+    # Add normalized column to timetable
+    timetable_with_norm = timetable_df.withColumn(
+        "_search_name", _search_name_udf("station_name")
     )
 
-    # --- Stage 1: Exact match on station_lookup_df ---
+    # --- Stage 1: Exact match ---
+    lookup_renamed = station_lookup_df.select(
+        sf.col("search_name").alias("_ref_search_name"),
+        sf.col("ref_station_eva").alias("_ref_eva"),
+    )
+
     result_df = (
-        result_df.alias("t")
+        timetable_with_norm.alias("t")
         .join(
             sf.broadcast(lookup_renamed.alias("ref")),
-            sf.col("t.search_name") == sf.col("ref.ref_search_name"),
+            sf.col("t._search_name") == sf.col("ref._ref_search_name"),
             "left",
         )
         .withColumn(
             "station_eva",
-            sf.coalesce(sf.col("t.station_eva"), sf.col("ref.ref_station_eva")),
+            sf.coalesce(sf.col("t.station_eva"), sf.col("ref._ref_eva")),
         )
-        .drop("ref_station_eva", "ref_search_name")
+        .drop("_ref_search_name", "_ref_eva")
     )
 
-    # --- Stage 2: Fuzzy matching using edit distance ---
-    if fuzzy_threshold > 0:
-        # Drop search_name before fuzzy matching to avoid ambiguity in cross join
-        still_missing = result_df.filter(sf.col("station_eva").isNull()).drop(
-            "search_name"
+    # --- Stage 2: Fuzzy match for still-unmatched records ---
+    still_missing = result_df.filter(
+        sf.col("station_eva").isNull() & sf.col("_search_name").isNotNull()
+    )
+    already_matched = result_df.filter(sf.col("station_eva").isNotNull())
+
+    missing_names = still_missing.select("_search_name").distinct()
+    missing_count = missing_names.count()
+
+    if missing_count > 0:
+        log.info(
+            "Stage 2: Fuzzy matching for %d distinct unmatched names (threshold=%.2f)",
+            missing_count,
+            similarity_threshold,
         )
-        already_matched = result_df.filter(sf.col("station_eva").isNotNull()).drop(
-            "search_name"
+
+        # Compute similarity for each unmatched name vs all lookup names
+        # Use both Levenshtein similarity AND Jaccard token overlap to avoid false positives
+        # e.g., "schulzendorf" vs "zehlendorf" has high Levenshtein but 0 Jaccard
+        fuzzy_candidates = (
+            missing_names.crossJoin(sf.broadcast(station_lookup_df))
+            # Levenshtein similarity
+            .withColumn(
+                "_lev_dist",
+                sf.levenshtein(sf.col("_search_name"), sf.col("search_name")),
+            )
+            .withColumn(
+                "_max_len",
+                sf.greatest(sf.length("_search_name"), sf.length("search_name")),
+            )
+            .withColumn(
+                "_lev_score",
+                sf.when(sf.col("_max_len") == 0, sf.lit(0.0)).otherwise(
+                    1.0 - (sf.col("_lev_dist") / sf.col("_max_len"))
+                ),
+            )
+            # Jaccard token similarity
+            .withColumn("_tokens1", sf.split("_search_name", " "))
+            .withColumn("_tokens2", sf.split("search_name", " "))
+            .withColumn("_intersect", sf.size(sf.array_intersect("_tokens1", "_tokens2")))
+            .withColumn("_union", sf.size(sf.array_union("_tokens1", "_tokens2")))
+            .withColumn(
+                "_jaccard",
+                sf.when(sf.col("_union") == 0, sf.lit(0.0)).otherwise(
+                    sf.col("_intersect") / sf.col("_union")
+                ),
+            )
+            # Require BOTH: Levenshtein >= threshold AND at least one shared token
+            .filter(
+                (sf.col("_lev_score") >= similarity_threshold)
+                & (sf.col("_intersect") > 0)
+            )
+            .withColumnRenamed("_lev_score", "_score")
+            .drop("_lev_dist", "_max_len", "_tokens1", "_tokens2", "_intersect", "_union")
         )
 
-        missing_count = still_missing.count()
-        if missing_count > 0:
-            log.info(
-                "Fuzzy matching %d unmatched records (edit distance threshold=%.2f)...",
-                missing_count,
-                fuzzy_threshold,
+        # Keep best match per search name
+        w = Window.partitionBy("_search_name").orderBy(sf.col("_score").desc())
+        best_fuzzy = (
+            fuzzy_candidates.withColumn("_rn", sf.row_number().over(w))
+            .filter(sf.col("_rn") == 1)
+            .select(
+                "_search_name",
+                sf.col("ref_station_eva").alias("_fuzzy_eva"),
+                sf.col("search_name").alias("_matched_name"),
+                "_score",
             )
+        )
 
-            # Cross join missing records with lookup table and compute distance metrics
-            # Use original station_lookup_df (with search_name) for fuzzy comparison
-            cross_matched = (
-                still_missing.filter(sf.col("station_name").isNotNull())
-                .crossJoin(sf.broadcast(station_lookup_df))
-                .withColumn(
-                    "edit_distance",
-                    _edit_distance_udf(sf.col("station_name"), sf.col("search_name")),
-                )
-                .withColumn(
-                    "jaccard_sim",
-                    _jaccard_udf(sf.col("station_name"), sf.col("search_name")),
-                )
-                .filter(
-                    # Normalized edit distance threshold (e.g., max 30% different)
-                    (sf.col("edit_distance") <= fuzzy_threshold)
-                    &
-                    # Require at least some token overlap to avoid matching unrelated names
-                    (sf.col("jaccard_sim") >= 0.3)
-                )
+        # Log fuzzy matches
+        fuzzy_match_count = best_fuzzy.count()
+        log.info("Fuzzy matched %d/%d names", fuzzy_match_count, missing_count)
+        if fuzzy_match_count > 0:
+            log.info("Fuzzy matches:")
+            best_fuzzy.orderBy(sf.col("_score").desc()).show(20, truncate=False)
+
+        # Join fuzzy matches back to missing records
+        fuzzy_filled = (
+            still_missing.join(best_fuzzy, "_search_name", "left")
+            .withColumn(
+                "station_eva",
+                sf.coalesce(sf.col("station_eva"), sf.col("_fuzzy_eva")),
             )
+            .drop("_fuzzy_eva", "_matched_name", "_score")
+        )
 
-            # Find best match per station_name:
-            # - Primary: lowest edit distance (order-preserving)
-            # - Secondary: highest Jaccard similarity (for tie-breaking)
-            w = Window.partitionBy("station_name").orderBy(
-                sf.col("edit_distance").asc(), sf.col("jaccard_sim").desc()
+        # Combine matched and fuzzy-filled
+        result_df = already_matched.unionByName(fuzzy_filled)
+
+    # Log final statistics
+    total_count = result_df.count()
+    matched_count = result_df.filter(sf.col("station_eva").isNotNull()).count()
+    unmatched_count = total_count - matched_count
+    log.info(
+        "Station EVA backfill: %d/%d records have station_eva (%.1f%%)",
+        matched_count,
+        total_count,
+        100.0 * matched_count / total_count if total_count > 0 else 0,
+    )
+
+    # Log remaining unmatched names with their best candidates
+    if unmatched_count > 0:
+        unmatched_names = (
+            result_df.filter(sf.col("station_eva").isNull())
+            .select("station_name", "_search_name")
+            .distinct()
+        )
+        unmatched_distinct = unmatched_names.count()
+        log.info(
+            "Still unmatched: %d records, %d distinct names",
+            unmatched_count,
+            unmatched_distinct,
+        )
+
+        # Show best candidates for unmatched (even below threshold)
+        candidates = (
+            unmatched_names.crossJoin(sf.broadcast(station_lookup_df))
+            .withColumn(
+                "_score",
+                1.0
+                - (
+                    sf.levenshtein(sf.col("_search_name"), sf.col("search_name"))
+                    / sf.greatest(sf.length("_search_name"), sf.length("search_name"))
+                ),
             )
-            best_matches = (
-                cross_matched.withColumn("_rn", sf.row_number().over(w))
-                .filter(sf.col("_rn") == 1)
-                .select(
-                    "station_name",
-                    sf.col("ref_station_eva").alias("fuzzy_eva"),
-                    sf.col("search_name").alias("matched_name"),
-                    "edit_distance",
-                    "jaccard_sim",
-                )
+        )
+        w = Window.partitionBy("station_name").orderBy(sf.col("_score").desc())
+        top_candidates = (
+            candidates.withColumn("_rank", sf.row_number().over(w))
+            .filter(sf.col("_rank") <= 3)
+            .select(
+                "station_name",
+                "_search_name",
+                sf.col("search_name").alias("candidate"),
+                sf.col("ref_station_eva").alias("candidate_eva"),
+                sf.round("_score", 3).alias("score"),
             )
+            .orderBy("station_name", sf.col("score").desc())
+        )
+        log.info("Unmatched names with best candidates (below threshold):")
+        top_candidates.show(30, truncate=False)
 
-            # Log some examples of fuzzy matches for debugging
-            log.info("Sample fuzzy matches:")
-            best_matches.select(
-                "station_name", "matched_name", "fuzzy_eva", "edit_distance", "jaccard_sim"
-            ).show(10, truncate=False)
-
-            # Join best matches back to missing rows
-            fuzzy_filled = (
-                still_missing.alias("m")
-                .join(best_matches.alias("f"), "station_name", "left")
-                .withColumn(
-                    "station_eva",
-                    sf.coalesce(sf.col("m.station_eva"), sf.col("f.fuzzy_eva")),
-                )
-                .drop("fuzzy_eva", "matched_name", "edit_distance", "jaccard_sim")
-            )
-
-            # Combine matched and fuzzy-filled
-            result_df = already_matched.unionByName(fuzzy_filled)
-    else:
-        # No fuzzy matching, just drop search_name
-        result_df = result_df.drop("search_name")
+    # Drop the temporary column
+    result_df = result_df.drop("_search_name")
 
     return result_df
 
@@ -600,18 +577,7 @@ from pyspark.sql.window import Window
 def resolve_latest_stop_state(timetable_df, changes_df):
     """
     Resolve the latest state for each (stop_id, station_eva) pair.
-
-    This mirrors the logic in spark_etl_by_steps.py:get_last_values_for_stop()
-    which uses sf.last(col, ignorenulls=True) for ALL columns including cancellation.
-
-    Key differences from previous implementation:
-    1. Filter out NULL station_eva BEFORE resolution (matching spark_etl_by_steps.py line 441)
-    2. Use last(ignorenulls=True) for cancellation instead of max() - cancellation
-       should follow the same pattern as other columns
-    3. Preserve planned times from changes feed (ar_pt, dp_pt) since changes XML
-       also contains these values
     """
-
 
     # 1. Filter out NULL keys first
     timetable_df = timetable_df.filter(
@@ -727,7 +693,6 @@ def resolve_latest_stop_state(timetable_df, changes_df):
         filtered_changes.select(common_cols)
     )
 
-
     # 3. Carry forward last known non-null value per field
 
     w_history = (
@@ -768,9 +733,8 @@ def resolve_latest_stop_state(timetable_df, changes_df):
     resolved = (
         events.withColumn("_rn", F.row_number().over(w_latest))
         .filter(F.col("_rn") == 1)
-        .drop("_rn", "snapshot_key")
+        .drop("_rn")
     )
-
 
     # 4. Final derived fields
     resolved = (
@@ -805,87 +769,54 @@ def resolve_latest_stop_state(timetable_df, changes_df):
 
 
 # ==================== TASK 3.2 – Average daily delay ====================
+def compute_average_daily_delay(
+    changes_df, start_date=None, end_date=None, station_eva=None
+):
+    df = changes_df
 
-def compute_average_daily_delay(resolved_df, start_date=None, end_date=None, station_eva=None):
-    """Average delay per station, excluding cancelled/hidden stops.
+    # choose a service timestamp for filtering (ct if present else pt)
+    ar_service = sf.coalesce(sf.col("ar_ct"), sf.col("ar_pt"))
+    dp_service = sf.coalesce(sf.col("dp_ct"), sf.col("dp_pt"))
 
-    Operates on resolved final state (one row per stop) so each train is
-    counted once.  delay = changed_time − planned_time in minutes.
+    df = df.withColumn("service_date", sf.to_date(sf.coalesce(ar_service, dp_service)))
 
-    IMPORTANT: Delay is only computed when there's a changed time (ct).
-    If there's no change, the stop ran on time (or we don't know), so
-    delay is NULL, not 0.
-
-    Corresponds to fact_changed.py: _delay_minutes() (L441–L445) applied
-    inside upsert_fact_movement_from_changes_snapshot() (L755–L762).
-    """
     if start_date:
-        resolved_df = resolved_df.filter(
-            sf.col("actual_arrival_ts")
-            >= sf.to_timestamp(sf.lit(start_date), "yyyy-MM-dd")
-        )
+        df = df.filter(sf.col("service_date") >= sf.lit(start_date))
     if end_date:
-        resolved_df = resolved_df.filter(
-            sf.col("actual_arrival_ts")
-            < sf.to_timestamp(sf.lit(end_date), "yyyy-MM-dd")
-        )
+        df = df.filter(sf.col("service_date") < sf.lit(end_date))
     if station_eva:
-        resolved_df = resolved_df.filter(sf.col("station_eva") == station_eva)
+        df = df.filter(sf.col("station_eva") == sf.lit(station_eva))
 
-    # CRITICAL FIX: Delay = changed_time - planned_time, NOT actual - planned
-    # Only compute delay when there's actually a changed time (ct).
-    # If changed_time is NULL, delay should be NULL (not 0).
-    # This matches Python fact_changed.py:_delay_minutes() which requires
-    # both planned and changed times to be non-NULL.
-    df = resolved_df.withColumn(
+    # delay only when ct exists; baseline is pt from same row
+    df = df.withColumn(
         "arrival_delay_min",
         sf.when(
-            sf.col("changed_arrival_ts").isNotNull()
-            & sf.col("planned_arrival_ts").isNotNull()
+            sf.col("ar_ct").isNotNull()
+            & sf.col("ar_pt").isNotNull()
             & ~sf.col("arrival_cancelled")
             & ~sf.col("arrival_is_hidden"),
-            sf.round(
-                (
-                    sf.unix_timestamp("changed_arrival_ts")
-                    - sf.unix_timestamp("planned_arrival_ts")
-                )
-                / 60.0
-            ),
-        ).cast("int"),
+            (sf.col("ar_ct").cast("long") - sf.col("ar_pt").cast("long")) / 60.0,
+        ),
     ).withColumn(
         "departure_delay_min",
         sf.when(
-            sf.col("changed_departure_ts").isNotNull()
-            & sf.col("planned_departure_ts").isNotNull()
+            sf.col("dp_ct").isNotNull()
+            & sf.col("dp_pt").isNotNull()
             & ~sf.col("departure_cancelled")
             & ~sf.col("departure_is_hidden"),
-            sf.round(
-                (
-                    sf.unix_timestamp("changed_departure_ts")
-                    - sf.unix_timestamp("planned_departure_ts")
-                )
-                / 60.0
-            ),
-        ).cast("int"),
+            (sf.col("dp_ct").cast("long") - sf.col("dp_pt").cast("long")) / 60.0,
+        ),
     )
 
-    avg_arr = (
-        df.filter(sf.col("arrival_delay_min").isNotNull())
-        .groupBy("station_eva")
-        .agg(sf.round(sf.avg("arrival_delay_min"), 2).alias("avg_arrival_delay_min"))
-    )
-    avg_dep = (
-        df.filter(sf.col("departure_delay_min").isNotNull())
-        .groupBy("station_eva")
-        .agg(sf.round(sf.avg("departure_delay_min"), 2).alias("avg_departure_delay_min"))
+    # if you truly mean "average daily delay": average per day, then average those
+    daily = df.groupBy("station_eva", "service_date").agg(
+        sf.avg("arrival_delay_min").alias("daily_avg_arrival_delay_min"),
+        sf.avg("departure_delay_min").alias("daily_avg_departure_delay_min"),
     )
 
-    joined = avg_arr.join(avg_dep, "station_eva", "outer")
-    return joined.fillna(
-        {
-            "avg_arrival_delay_min": 0.0,
-            "avg_departure_delay_min": 0.0,
-        }
+    return daily.groupBy("station_eva").agg(
+        sf.avg("daily_avg_arrival_delay_min").alias("avg_daily_arrival_delay_min"),
+        sf.avg("daily_avg_departure_delay_min").alias("avg_daily_departure_delay_min"),
     )
 
 
@@ -1086,4 +1017,3 @@ if __name__ == "__main__":
         main(spark)
 
     spark.stop()
-

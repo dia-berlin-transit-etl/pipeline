@@ -41,6 +41,11 @@ services:
       - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 1g
     command: >
       bash -c "mkdir -p /opt/spark/work-dir/.ivy2 &&
                /opt/spark/sbin/start-master.sh &&
@@ -52,8 +57,8 @@ services:
     depends_on:
       - spark-master
     environment:
-      - SPARK_WORKER_CORES=2 # Adjust based on your CPU
-      - SPARK_WORKER_MEMORY=2G # Adjust based on your RAM
+      - SPARK_WORKER_CORES=4 # Adjust based on your CPU
+      - SPARK_WORKER_MEMORY=5G # Adjust based on your RAM
       - SPARK_SUBMIT_OPTS=-Divy.home=/opt/spark/work-dir/.ivy2
     volumes:
       - ./spark_etl/:/opt/spark-apps 
@@ -62,6 +67,11 @@ services:
       - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 6g   
     command: >
       bash -c "mkdir -p /opt/spark/work-dir/.ivy2 &&
                /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
