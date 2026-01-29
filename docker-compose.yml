@@ -39,6 +39,7 @@ services:
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
       - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
+      #- ./station_data.json:/opt/spark-data/station_data.json:ro
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
     command: >
