@@ -619,59 +619,53 @@ def resolve_latest_stop_state(timetable_df, changes_df):
 
 # ==================== TASK 3.2 – Average daily delay ====================
 
-def compute_average_daily_delay(resolved_df, start_date=None, end_date=None, station_eva=None):
-    """Average delay per station, excluding cancelled/hidden stops.
+def compute_avg_delay_from_changes(changes_df, start_date=None, end_date=None, station_eva=None):
+    df = changes_df
 
-    Operates on resolved final state (one row per stop) so each train is
-    counted once.  delay = actual_time − planned_time in minutes.
+    # choose a service timestamp for filtering (ct if present else pt)
+    ar_service = sf.coalesce(sf.col("ar_ct"), sf.col("ar_pt"))
+    dp_service = sf.coalesce(sf.col("dp_ct"), sf.col("dp_pt"))
 
-    Corresponds to fact_changed.py: _delay_minutes() (L441–L445) applied
-    inside upsert_fact_movement_from_changes_snapshot() (L755–L762),
-    but computed here on the resolved final state rather than per-snapshot.
-    """
+    df = df.withColumn("service_date", sf.to_date(sf.coalesce(ar_service, dp_service)))
+
     if start_date:
-        resolved_df = resolved_df.filter(
-            sf.col("actual_arrival_ts")
-            >= sf.to_timestamp(sf.lit(start_date), "yyyy-MM-dd")
-        )
+        df = df.filter(sf.col("service_date") >= sf.lit(start_date))
     if end_date:
-        resolved_df = resolved_df.filter(
-            sf.col("actual_arrival_ts") < sf.to_timestamp(sf.lit(end_date), "yyyy-MM-dd")
-        )
+        df = df.filter(sf.col("service_date") < sf.lit(end_date))
     if station_eva:
-        resolved_df = resolved_df.filter(sf.col("station_eva") == station_eva)
-    df = resolved_df.withColumn(
+        df = df.filter(sf.col("station_eva") == sf.lit(station_eva))
+
+    # delay only when ct exists; baseline is pt from same row
+    df = df.withColumn(
         "arrival_delay_min",
         sf.when(
-            sf.col("actual_arrival_ts").isNotNull()
-            & sf.col("planned_arrival_ts").isNotNull()
-            & ~sf.col("arrival_cancelled") & ~sf.col("arrival_is_hidden"),
-            (sf.unix_timestamp("actual_arrival_ts")
-             - sf.unix_timestamp("planned_arrival_ts")) / 60,
-        ).cast("int"),   # float??
+            sf.col("ar_ct").isNotNull()
+            & sf.col("ar_pt").isNotNull()
+            & ~sf.col("arrival_cancelled")
+            & ~sf.col("arrival_is_hidden"),
+            (sf.col("ar_ct").cast("long") - sf.col("ar_pt").cast("long")) / 60.0
+        )
     ).withColumn(
         "departure_delay_min",
         sf.when(
-            sf.col("actual_departure_ts").isNotNull()
-            & sf.col("planned_departure_ts").isNotNull()
-            & ~sf.col("departure_cancelled") & ~sf.col("departure_is_hidden"),
-            (sf.unix_timestamp("actual_departure_ts")
-             - sf.unix_timestamp("planned_departure_ts")) / 60,
-        ).cast("int"),   # float??
+            sf.col("dp_ct").isNotNull()
+            & sf.col("dp_pt").isNotNull()
+            & ~sf.col("departure_cancelled")
+            & ~sf.col("departure_is_hidden"),
+            (sf.col("dp_ct").cast("long") - sf.col("dp_pt").cast("long")) / 60.0
+        )
     )
 
-    avg_arr = (df.filter(sf.col("arrival_delay_min").isNotNull())
-               .groupBy("station_eva")
-               .agg(sf.avg("arrival_delay_min").alias("avg_arrival_delay_min")))
-    avg_dep = (df.filter(sf.col("departure_delay_min").isNotNull())
-               .groupBy("station_eva")
-               .agg(sf.avg("departure_delay_min").alias("avg_departure_delay_min")))
+    # if you truly mean "average daily delay": average per day, then average those
+    daily = df.groupBy("station_eva", "service_date").agg(
+        sf.avg("arrival_delay_min").alias("daily_avg_arrival_delay_min"),
+        sf.avg("departure_delay_min").alias("daily_avg_departure_delay_min"),
+    )
 
-    joined = avg_arr.join(avg_dep, "station_eva", "outer")
-    return joined.fillna({
-        "avg_arrival_delay_min": 0.0,
-        "avg_departure_delay_min": 0.0,
-    })
+    return daily.groupBy("station_eva").agg(
+        sf.avg("daily_avg_arrival_delay_min").alias("avg_daily_arrival_delay_min"),
+        sf.avg("daily_avg_departure_delay_min").alias("avg_daily_departure_delay_min"),
+    )
 
 # ==================== TASK 3.3 – Peak-hour departures ====================
 
@@ -783,7 +777,7 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
     # TODO: assert avg_arrival_delay_min/avg_departure_delay_min type as minutes
     log.info("Task 3.2 – Computing average daily delay per station...")
     t1 = time.time()
-    avg_delay = compute_average_daily_delay(
+    avg_delay = compute_avg_delay_from_changes(
         resolved, start_date="2025-10-04", end_date="2025-10-07", station_eva=8011162
     )
     avg_delay.show(10)
