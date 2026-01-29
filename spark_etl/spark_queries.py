@@ -1,6 +1,7 @@
 import re
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as sf
+from pyspark.sql.window import Window
 
 
 def to_station_search_name(name: str) -> str:
@@ -41,86 +42,89 @@ def to_station_search_name(name: str) -> str:
 
 
 
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
-def compute_average_daily_delay_from_resolved(
-    resolved_df,
-    start_date=None,   # "yyyy-MM-dd"
-    end_date=None,     # "yyyy-MM-dd" (exclusive)
-    station_eva=None,
-    use_fallback=False,   # set True if you want delay even without changed_* timestamps
+def compute_avg_daily_delay(
+    df,
+    *,
+    start_date: str,
+    end_date: str,
+    station_eva: int,
+    use_fallback: bool = True,   # True => use actual_* when changed_* is NULL
 ):
-    df = resolved_df
-
-    # Filter by snapshot_date (already a DATE in your schema)
-    if start_date:
-        df = df.filter(sf.col("snapshot_date") >= sf.to_date(sf.lit(start_date)))
-    if end_date:
-        df = df.filter(sf.col("snapshot_date") < sf.to_date(sf.lit(end_date)))
-    if station_eva is not None:
-        df = df.filter(sf.col("station_eva") == sf.lit(station_eva))
-
-    # Hidden flags: prefer change-hidden when available, else final hidden
-    arr_hidden = sf.coalesce(sf.col("ch_arrival_is_hidden"), sf.col("arrival_is_hidden"), sf.lit(False))
-    dep_hidden = sf.coalesce(sf.col("ch_departure_is_hidden"), sf.col("departure_is_hidden"), sf.lit(False))
-
-    # --- Arrival delay ---
-    # Primary (DB semantics): ct - pt from the same change record
-    arrival_delay_primary = sf.when(
-        sf.col("changed_arrival_ts").isNotNull()
-        & sf.col("ch_planned_arrival_ts").isNotNull()
-        & ~sf.coalesce(sf.col("arrival_cancelled"), sf.lit(False))
-        & ~arr_hidden,
-        (sf.col("changed_arrival_ts").cast("long") - sf.col("ch_planned_arrival_ts").cast("long")) / 60.0
+    # Filter to station + date window (end_date exclusive, like your SQL example)
+    base = (
+        df.filter(sf.col("station_eva") == sf.lit(int(station_eva)))
+          .filter(sf.col("snapshot_date") >= sf.to_date(sf.lit(start_date)))
+          .filter(sf.col("snapshot_date") <  sf.to_date(sf.lit(end_date)))
     )
 
-    # Optional fallback: actual - planned (less faithful, but fills more values)
-    arrival_delay_fallback = sf.when(
-        sf.col("actual_arrival_ts").isNotNull()
-        & sf.col("planned_arrival_ts").isNotNull()
-        & ~sf.coalesce(sf.col("arrival_cancelled"), sf.lit(False))
-        & ~arr_hidden,
-        (sf.col("actual_arrival_ts").cast("long") - sf.col("planned_arrival_ts").cast("long")) / 60.0
+    # Latest row per (station_eva, stop_id, snapshot_date) using snapshot_key desc
+    w = (
+        Window
+        .partitionBy("station_eva", "stop_id", "snapshot_date")
+        .orderBy(sf.col("snapshot_key").desc_nulls_last())
+    )
+    latest = base.withColumn("rn", sf.row_number().over(w)).filter(sf.col("rn") == 1).drop("rn")
+
+    # Choose which observed timestamp to compare against planned
+    # If use_fallback: coalesce(changed, actual); else only changed
+    arr_obs_ts = sf.col("changed_arrival_ts") if not use_fallback else sf.coalesce(sf.col("changed_arrival_ts"), sf.col("actual_arrival_ts"))
+    dep_obs_ts = sf.col("changed_departure_ts") if not use_fallback else sf.coalesce(sf.col("changed_departure_ts"), sf.col("actual_departure_ts"))
+
+    # Compute delay in minutes (double)
+    arrival_delay_min = (arr_obs_ts.cast("long") - sf.col("planned_arrival_ts").cast("long")) / sf.lit(60.0)
+    departure_delay_min = (dep_obs_ts.cast("long") - sf.col("planned_departure_ts").cast("long")) / sf.lit(60.0)
+
+    latest = (
+        latest
+        .withColumn("arrival_delay_min", sf.when(arr_obs_ts.isNotNull() & sf.col("planned_arrival_ts").isNotNull(), arrival_delay_min))
+        .withColumn("departure_delay_min", sf.when(dep_obs_ts.isNotNull() & sf.col("planned_departure_ts").isNotNull(), departure_delay_min))
     )
 
-    arrival_delay = sf.coalesce(arrival_delay_primary, arrival_delay_fallback) if use_fallback else arrival_delay_primary
+    # Build delay observations stream: arrival UNION ALL departure (like your SQL)
+    arr_obs = (
+        latest
+        .select("snapshot_date", sf.col("arrival_delay_min").alias("delay_min"))
+        .where(sf.col("delay_min").isNotNull())
+        .where(sf.col("delay_min") >= 0)
+        .where(sf.coalesce(sf.col("arrival_cancelled"), sf.lit(False)) == sf.lit(False))
+        .where(sf.coalesce(sf.col("arrival_is_hidden"), sf.lit(False)) == sf.lit(False))
+    )
+    dep_obs = (
+        latest
+        .select("snapshot_date", sf.col("departure_delay_min").alias("delay_min"))
+        .where(sf.col("delay_min").isNotNull())
+        .where(sf.col("delay_min") >= 0)
+        .where(sf.coalesce(sf.col("departure_cancelled"), sf.lit(False)) == sf.lit(False))
+        .where(sf.coalesce(sf.col("departure_is_hidden"), sf.lit(False)) == sf.lit(False))
+    )
+    delay_obs = arr_obs.unionByName(dep_obs)
 
-    # --- Departure delay ---
-    departure_delay_primary = sf.when(
-        sf.col("changed_departure_ts").isNotNull()
-        & sf.col("ch_planned_departure_ts").isNotNull()
-        & ~sf.coalesce(sf.col("departure_cancelled"), sf.lit(False))
-        & ~dep_hidden,
-        (sf.col("changed_departure_ts").cast("long") - sf.col("ch_planned_departure_ts").cast("long")) / 60.0
+    # Daily average delay + counts
+    daily = (
+        delay_obs.groupBy("snapshot_date")
+        .agg(
+            sf.avg("delay_min").alias("daily_avg_delay_min"),
+            sf.count("*").alias("n_delay_observations"),
+        )
+        .orderBy("snapshot_date")
     )
 
-    departure_delay_fallback = sf.when(
-        sf.col("actual_departure_ts").isNotNull()
-        & sf.col("planned_departure_ts").isNotNull()
-        & ~sf.coalesce(sf.col("departure_cancelled"), sf.lit(False))
-        & ~dep_hidden,
-        (sf.col("actual_departure_ts").cast("long") - sf.col("planned_departure_ts").cast("long")) / 60.0
+    # Average daily delay over the period (equal weight per day)
+    overall = (
+        daily.agg(
+            sf.avg("daily_avg_delay_min").alias("avg_daily_delay_min"),
+            sf.sum("n_delay_observations").alias("total_delay_observations"),
+            sf.count("*").alias("n_days"),
+        )
+        .withColumn("station_eva", sf.lit(int(station_eva)))
+        .select("station_eva", "avg_daily_delay_min", "n_days", "total_delay_observations")
     )
 
-    departure_delay = sf.coalesce(departure_delay_primary, departure_delay_fallback) if use_fallback else departure_delay_primary
+    return daily, overall
 
-    df = df.withColumn("arrival_delay_min", arrival_delay)\
-           .withColumn("departure_delay_min", departure_delay)
-
-    # TRUE "average daily": compute per-day average first, then average those days
-    daily = df.groupBy("station_eva", "snapshot_date").agg(
-        sf.avg("arrival_delay_min").alias("daily_avg_arrival_delay_min"),
-        sf.avg("departure_delay_min").alias("daily_avg_departure_delay_min"),
-    )
-
-    out = daily.groupBy("station_eva").agg(
-        sf.avg("daily_avg_arrival_delay_min").alias("avg_daily_arrival_delay_min"),
-        sf.avg("daily_avg_departure_delay_min").alias("avg_daily_departure_delay_min"),
-    )
-
-    return out.fillna({
-        "avg_daily_arrival_delay_min": 0.0,
-        "avg_daily_departure_delay_min": 0.0,
-    })
 
 
 
@@ -230,31 +234,37 @@ def main():
 
     print("rows in window for station =", base.count())
 
-    # 3) Inspect whether delay inputs exist (this tells you why delays become null)
+    # 3) Inspect whether delay inputs exist (new schema columns)
     base.select(
         "snapshot_date",
-        "ch_planned_arrival_ts", "changed_arrival_ts",
-        "ch_planned_departure_ts", "changed_departure_ts",
-        "planned_arrival_ts", "actual_arrival_ts",
-        "planned_departure_ts", "actual_departure_ts",
+        "planned_arrival_ts", "changed_arrival_ts",
+        "planned_departure_ts", "changed_departure_ts",
+        "actual_arrival_ts", "actual_departure_ts",
         "arrival_cancelled", "departure_cancelled",
-        "ch_arrival_is_hidden", "ch_departure_is_hidden",
         "arrival_is_hidden", "departure_is_hidden",
+        "category", "train_number",
+        "stop_id", "snapshot_key",
     ).show(50, truncate=False)
 
-    # 4) Compute delays
-    out = compute_average_daily_delay_from_resolved(
+    base.select(
+        F.count("*").alias("rows"),
+        F.sum(F.col("changed_arrival_ts").isNotNull().cast("int")).alias("n_changed_arr"),
+        F.sum(F.col("changed_departure_ts").isNotNull().cast("int")).alias("n_changed_dep"),
+        F.sum(F.col("actual_arrival_ts").isNotNull().cast("int")).alias("n_actual_arr"),
+        F.sum(F.col("actual_departure_ts").isNotNull().cast("int")).alias("n_actual_dep"),
+    ).show(truncate=False)
+
+
+    daily, overall = compute_avg_daily_delay(
         df,
         start_date=start_date,
         end_date=end_date,
         station_eva=station_eva,
-        use_fallback=False,   # switch to True if changed_* is sparse
+        use_fallback=True,   # IMPORTANT with your data (changed_* is mostly NULL)
     )
 
-    out.show(truncate=False)
-
-    df.printSchema()
-    
+    daily.show(50, truncate=False)
+    overall.show(truncate=False)
 
     spark.stop()
 
