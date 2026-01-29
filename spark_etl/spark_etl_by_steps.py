@@ -77,7 +77,7 @@ def extract_data_from_xml(spark, file_path, schema):
         .withColumn("fileName", sf.input_file_name())
     )
     # you had this; keep it (tune if needed)
-    df = df.coalesce(48)
+    df = df.coalesce(96)  # more parallelism headroom
     return df
 
 
