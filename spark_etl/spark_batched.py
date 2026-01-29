@@ -1,22 +1,12 @@
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as sf
-from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType, TimestampType, DateType
 import xml.etree.ElementTree as ET
 import logging
 import re
 import time
 import json
 import os
-
-GENERIC = {
-    "bahnhof",
-    "station",
-    "haltepunkt",
-    "sbahn",
-    "ubahn",
-    "bahn",
-    "berlin",
-}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +31,11 @@ def test_distributed_write(spark, path):
 
 
 # ==================== SCHEMAS (Task 3.1) ====================
+# Three schemas are defined:
+# - TIMETABLE_SCHEMA: Raw planned timetable data from XML (ar@pt, dp@pt, etc.)
+# - CHANGES_SCHEMA: Raw changes data from XML (ar@ct, dp@ct, ar@cs, dp@cs, etc.)
+# - MOVEMENT_SCHEMA: Final resolved movement data (one row per stop_id, station_eva)
+#
 # Raw column names use the XML attribute names (pt, ct, ps, cs, hi)
 # to stay close to the source format.  Derived columns after transform
 # use the fact_movement naming convention (arrival_*, departure_*).
@@ -59,27 +54,55 @@ TIMETABLE_SCHEMA = StructType([
     StructField("departure_is_hidden", BooleanType()), # dp hi="1"
 ])
 
-CHANGES_SCHEMA = StructType([
-    StructField("snapshot_key", StringType()),
+CHANGES_SCHEMA = StructType(
+    [
+        StructField("snapshot_key", StringType()),
+        StructField("station_eva", LongType()),
+        StructField("station_name", StringType()),
+        StructField("stop_id", StringType()),
+        StructField("category", StringType()),
+        StructField("train_number", StringType()),
+        StructField("owner", StringType()),
+        StructField("ar_pt", StringType()),  # ar@pt
+        StructField("ar_ct", StringType()),  # ar@ct (changed time)
+        StructField("ar_ps", StringType()),  # ar@ps (planned status)
+        StructField("ar_cs", StringType()),  # ar@cs (cancellation status)
+        StructField(
+            "ar_clt", StringType()
+        ),  # ar@clt (cancellation time) - REQUIRED for valid cancellation
+        StructField("arrival_is_hidden", BooleanType()),
+        StructField("dp_pt", StringType()),  # dp@pt
+        StructField("dp_ct", StringType()),  # dp@ct
+        StructField("dp_ps", StringType()),  # dp@ps
+        StructField("dp_cs", StringType()),  # dp@cs
+        StructField(
+            "dp_clt", StringType()
+        ),  # dp@clt (cancellation time) - REQUIRED for valid cancellation
+        StructField("departure_is_hidden", BooleanType()),
+        StructField("is_added_by_suffix", BooleanType()),
+    ]
+)
+
+# Schema for the final resolved movement data (one row per stop_id, station_eva)
+# This is the output of resolve_latest_stop_state() written to final_movements parquet
+MOVEMENT_SCHEMA = StructType([
     StructField("station_eva", LongType()),
-    StructField("station_name", StringType()),
     StructField("stop_id", StringType()),
+    StructField("station_name", StringType()),
     StructField("category", StringType()),
     StructField("train_number", StringType()),
-    StructField("owner", StringType()),
-    StructField("ar_pt", StringType()),           # ar@pt
-    StructField("ar_ct", StringType()),           # ar@ct (changed time)
-    StructField("ar_ps", StringType()),           # ar@ps (planned status)
-    StructField("ar_cs", StringType()),           # ar@cs (cancellation status)
+    StructField("planned_arrival_ts", TimestampType()),
+    StructField("planned_departure_ts", TimestampType()),
+    StructField("changed_arrival_ts", TimestampType()),
+    StructField("changed_departure_ts", TimestampType()),
+    StructField("actual_arrival_ts", TimestampType()),
+    StructField("actual_departure_ts", TimestampType()),
+    StructField("arrival_cancelled", BooleanType()),
+    StructField("departure_cancelled", BooleanType()),
     StructField("arrival_is_hidden", BooleanType()),
-    StructField("dp_pt", StringType()),           # dp@pt
-    StructField("dp_ct", StringType()),           # dp@ct
-    StructField("dp_ps", StringType()),           # dp@ps
-    StructField("dp_cs", StringType()),           # dp@cs
     StructField("departure_is_hidden", BooleanType()),
-    StructField("is_added_by_suffix", BooleanType()),
+    StructField("snapshot_date", DateType()),  # partition column
 ])
-
 
 # ==================== PARSING (Task 3.1 – Extract) ====================
 # Each parser runs inside mapPartitions: one task per batch of XMLs, not
@@ -108,55 +131,74 @@ def to_station_search_name(name: str) -> str:
 
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # remove any punctuation
-    s = re.sub(r"[^\w\s]", "", s)
     return s
 
 
-def parse_tokens(s):
-    """Split a string into common tokens in GENERIC and rest (lowercase)."""
-    tokens = set(s.lower().split())
-    generic_tokens = tokens.intersection(GENERIC)
-    specific_tokens = tokens.difference(GENERIC)
-    return generic_tokens, specific_tokens
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Calculate Levenshtein (edit) distance between two strings.
 
+    This respects character order and measures the minimum number of
+    single-character edits (insertions, deletions, substitutions)
+    needed to transform s1 into s2.
 
-def extract_specific_tokens(name: str) -> str:
-    """Extract non-generic tokens from a normalized station name.
-
-    Returns a space-separated string of specific tokens (excludes GENERIC words).
-    This is used for fuzzy matching - we only compare the meaningful parts.
+    Returns the edit distance (0 = identical).
     """
-    if not name:
-        return ""
-    # Normalize first
-    normalized = to_station_search_name(name)
-    # Split into tokens and filter out generic ones
-    tokens = normalized.split()
-    specific = [t for t in tokens if t not in GENERIC]
-    return " ".join(sorted(specific))  # Sort for consistency
+    if not s1:
+        return len(s2) if s2 else 0
+    if not s2:
+        return len(s1)
+
+    # Normalize both strings first
+    s1 = to_station_search_name(s1)
+    s2 = to_station_search_name(s2)
+
+    if s1 == s2:
+        return 0
+
+    len1, len2 = len(s1), len(s2)
+
+    # Use two rows instead of full matrix for memory efficiency
+    prev_row = list(range(len2 + 1))
+    curr_row = [0] * (len2 + 1)
+
+    for i in range(1, len1 + 1):
+        curr_row[0] = i
+        for j in range(1, len2 + 1):
+            cost = 0 if s1[i - 1] == s2[j - 1] else 1
+            curr_row[j] = min(
+                prev_row[j] + 1,      # deletion
+                curr_row[j - 1] + 1,  # insertion
+                prev_row[j - 1] + cost  # substitution
+            )
+        prev_row, curr_row = curr_row, prev_row
+
+    return prev_row[len2]
 
 
-def token_set_distance(name1: str, name2: str) -> int:
-    """Calculate token-level distance between two station names.
+def normalized_edit_distance(name1: str, name2: str) -> float:
+    """Calculate normalized edit distance between two station names.
 
-    Uses a token-based approach where:
-    - Each name is split into tokens
-    - Distance = number of tokens that differ between the sets
-    - This maps "berlin hauptbahnhof" to 2 tokens, not 18 characters
+    Normalizes by the length of the longer string to get a value between 0 and 1.
+    0.0 = identical, 1.0 = completely different.
 
-    Returns the symmetric difference size (tokens in one but not both).
+    This respects word order unlike token set distance.
     """
     if not name1 or not name2:
-        return 999  # Large distance for empty strings
+        return 1.0  # Maximum distance for empty strings
 
-    # Normalize and tokenize
-    tokens1 = set(to_station_search_name(name1).split())
-    tokens2 = set(to_station_search_name(name2).split())
+    s1 = to_station_search_name(name1)
+    s2 = to_station_search_name(name2)
 
-    # Symmetric difference = tokens in one set but not both
-    diff = tokens1.symmetric_difference(tokens2)
-    return len(diff)
+    if not s1 or not s2:
+        return 1.0
+
+    if s1 == s2:
+        return 0.0
+
+    dist = levenshtein_distance(s1, s2)
+    max_len = max(len(s1), len(s2))
+
+    return dist / max_len if max_len > 0 else 0.0
 
 
 def token_jaccard_similarity(name1: str, name2: str) -> float:
@@ -164,6 +206,8 @@ def token_jaccard_similarity(name1: str, name2: str) -> float:
 
     Jaccard = |intersection| / |union|
     Returns value between 0.0 (no overlap) and 1.0 (identical).
+
+    Used as a secondary metric after edit distance to break ties.
     """
     if not name1 or not name2:
         return 0.0
@@ -217,13 +261,10 @@ def create_station_lookup_df(spark, station_data_path):
     )
 
     # Get the main EVA (where isMain=true) or first EVA as fallback
-    # Use expr for compatibility with older Spark versions
     stations_df = stations_df.withColumn(
         "main_eva",
         sf.coalesce(
-            # First try: find EVA where isMain=true using SQL expression
             sf.expr("filter(evaNumbers, x -> x.isMain = true)[0].number"),
-            # Fallback: use first EVA in array
             sf.col("evaNumbers")[0]["number"],
         ),
     )
@@ -321,6 +362,7 @@ def parse_changes_partition(iterator):
       - tl@c, tl@n: skip Bus                           (L519–L522)
       - ar@ct, dp@ct → changed times                   (L529–L530)
       - ar@cs, dp@cs → cancellation signals             (L525–L526)
+      - ar@clt, dp@clt → cancellation times             (required for valid cancellation)
       - ar@ps, dp@ps → planned status (added detect)   (L513–L516)
       - hi="1" → hidden flags                           (L537–L538)
       - stop_id suffix >= 100 → added-stop heuristic    (L511, _stop_id_suffix_int)
@@ -350,11 +392,13 @@ def parse_changes_partition(iterator):
                     ar.get("ct") if ar is not None else None,
                     ar.get("ps") if ar is not None else None,
                     ar.get("cs") if ar is not None else None,
+                    ar.get("clt") if ar is not None else None,  # cancellation time
                     ar is not None and ar.get("hi") == "1",
                     dp.get("pt") if dp is not None else None,
                     dp.get("ct") if dp is not None else None,
                     dp.get("ps") if dp is not None else None,
                     dp.get("cs") if dp is not None else None,
+                    dp.get("clt") if dp is not None else None,  # cancellation time
                     dp is not None and dp.get("hi") == "1",
                     suffix >= 100,
                 )
@@ -380,28 +424,27 @@ def cast_timestamps(df, columns):
     return df.withColumn("snapshot_ts", sf.to_timestamp("snapshot_key", "yyMMddHHmm"))
 
 
-def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=2):
+def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=0.3):
     """Backfill missing station_eva on timetable rows using DataFrame joins.
 
     Uses a two-stage lookup strategy:
     1. Exact match: normalized station name matching
-    2. Fuzzy match: Token-level distance + Jaccard similarity
-       - Uses token set distance (symmetric difference) instead of char-level Levenshtein
-       - "berlin hauptbahnhof" maps to 2 tokens, not 18 characters
-       - Uses Jaccard similarity as a secondary ranking metric
+    2. Fuzzy match: Edit distance (Levenshtein) + Jaccard similarity
+       - Primary: Normalized edit distance (respects character/word order)
+       - Secondary: Jaccard similarity on tokens (for tie-breaking)
 
     Args:
         timetable_df: DataFrame with timetable records (may have null station_eva)
         station_lookup_df: DataFrame with (search_name, ref_station_eva) from station_data.json
-        fuzzy_threshold: Maximum token set distance for fuzzy match (default: 2 tokens)
+        fuzzy_threshold: Maximum normalized edit distance for fuzzy match (default: 0.3 = 30% different)
 
     Returns:
         DataFrame with station_eva backfilled where possible
     """
-    from pyspark.sql.types import IntegerType, DoubleType
+    from pyspark.sql.types import DoubleType
 
     _search_name_udf = sf.udf(to_station_search_name, StringType())
-    _token_distance_udf = sf.udf(token_set_distance, IntegerType())
+    _edit_distance_udf = sf.udf(normalized_edit_distance, DoubleType())
     _jaccard_udf = sf.udf(token_jaccard_similarity, DoubleType())
 
     # Add normalized search_name column to timetable
@@ -427,7 +470,7 @@ def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=2):
         .drop("ref_station_eva", "ref_search_name")
     )
 
-    # --- Stage 2: Fuzzy matching using token-level distance ---
+    # --- Stage 2: Fuzzy matching using edit distance ---
     if fuzzy_threshold > 0:
         # Drop search_name before fuzzy matching to avoid ambiguity in cross join
         still_missing = result_df.filter(sf.col("station_eva").isNull()).drop(
@@ -440,38 +483,38 @@ def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=2):
         missing_count = still_missing.count()
         if missing_count > 0:
             log.info(
-                "Fuzzy matching %d unmatched records (token threshold=%d)...",
+                "Fuzzy matching %d unmatched records (edit distance threshold=%.2f)...",
                 missing_count,
                 fuzzy_threshold,
             )
 
-            # Cross join missing records with lookup table and compute token-level metrics
+            # Cross join missing records with lookup table and compute distance metrics
             # Use original station_lookup_df (with search_name) for fuzzy comparison
             cross_matched = (
                 still_missing.filter(sf.col("station_name").isNotNull())
                 .crossJoin(sf.broadcast(station_lookup_df))
                 .withColumn(
-                    "token_distance",
-                    _token_distance_udf(sf.col("station_name"), sf.col("search_name")),
+                    "edit_distance",
+                    _edit_distance_udf(sf.col("station_name"), sf.col("search_name")),
                 )
                 .withColumn(
                     "jaccard_sim",
                     _jaccard_udf(sf.col("station_name"), sf.col("search_name")),
                 )
                 .filter(
-                    # Token distance threshold (e.g., max 2 different tokens)
-                    (sf.col("token_distance") <= fuzzy_threshold)
+                    # Normalized edit distance threshold (e.g., max 30% different)
+                    (sf.col("edit_distance") <= fuzzy_threshold)
                     &
-                    # Require at least some token overlap
+                    # Require at least some token overlap to avoid matching unrelated names
                     (sf.col("jaccard_sim") >= 0.3)
                 )
             )
 
             # Find best match per station_name:
-            # - Primary: lowest token distance
-            # - Secondary: highest Jaccard similarity
+            # - Primary: lowest edit distance (order-preserving)
+            # - Secondary: highest Jaccard similarity (for tie-breaking)
             w = Window.partitionBy("station_name").orderBy(
-                sf.col("token_distance").asc(), sf.col("jaccard_sim").desc()
+                sf.col("edit_distance").asc(), sf.col("jaccard_sim").desc()
             )
             best_matches = (
                 cross_matched.withColumn("_rn", sf.row_number().over(w))
@@ -479,7 +522,8 @@ def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=2):
                 .select(
                     "station_name",
                     sf.col("ref_station_eva").alias("fuzzy_eva"),
-                    "token_distance",
+                    sf.col("search_name").alias("matched_name"),
+                    "edit_distance",
                     "jaccard_sim",
                 )
             )
@@ -487,7 +531,7 @@ def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=2):
             # Log some examples of fuzzy matches for debugging
             log.info("Sample fuzzy matches:")
             best_matches.select(
-                "station_name", "fuzzy_eva", "token_distance", "jaccard_sim"
+                "station_name", "matched_name", "fuzzy_eva", "edit_distance", "jaccard_sim"
             ).show(10, truncate=False)
 
             # Join best matches back to missing rows
@@ -498,7 +542,7 @@ def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=2):
                     "station_eva",
                     sf.coalesce(sf.col("m.station_eva"), sf.col("f.fuzzy_eva")),
                 )
-                .drop("fuzzy_eva", "token_distance", "jaccard_sim")
+                .drop("fuzzy_eva", "matched_name", "edit_distance", "jaccard_sim")
             )
 
             # Combine matched and fuzzy-filled
@@ -513,108 +557,251 @@ def backfill_station_eva(timetable_df, station_lookup_df, fuzzy_threshold=2):
 def derive_change_flags(df):
     """Derive cancellation and added-stop flags on changes DataFrame.
 
-    Corresponds to fact_changed.py:
-      - _cancel_update_from_cs()  (L341–L358): cs='c' → cancelled
-      - _is_added_by_ps_or_cs()   (L360–L370): ps='a' or cs='a' → added
-      - _stop_id_suffix_int()     (L373–L381): suffix >= 100 → added
+    Matches spark_etl_by_steps.py process_event_status() logic:
+      - cs='c' AND clt IS NOT NULL → cancelled=True
+      - Otherwise → cancelled=False
+
+    Note: This differs slightly from the Python reference (fact_changed.py) which uses
+    tri-state logic (True/False/NULL for carry-forward). But spark_etl_by_steps.py
+    is the verified correct implementation, and it uses binary True/False.
     """
     return (
         df
-        .withColumn("arrival_cancelled", sf.col("ar_cs") == "c")
-        .withColumn("departure_cancelled", sf.col("dp_cs") == "c")
-        .withColumn("arrival_is_added",
-                     (sf.col("ar_ps") == "a")
-                     | (sf.col("ar_cs") == "a")
-                     | sf.col("is_added_by_suffix"))
-        .withColumn("departure_is_added",
-                     (sf.col("dp_ps") == "a")
-                     | (sf.col("dp_cs") == "a")
-                     | sf.col("is_added_by_suffix"))
+        # Cancellation requires BOTH cs='c' AND clt is NOT NULL
+        # This matches spark_etl_by_steps.py:process_event_status() L95
+        .withColumn(
+            "arrival_cancelled", (sf.col("ar_cs") == "c") & sf.col("ar_clt").isNotNull()
+        )
+        .withColumn(
+            "departure_cancelled",
+            (sf.col("dp_cs") == "c") & sf.col("dp_clt").isNotNull(),
+        )
+        .withColumn(
+            "arrival_is_added",
+            (sf.col("ar_ps") == "a")
+            | (sf.col("ar_cs") == "a")
+            | sf.col("is_added_by_suffix"),
+        )
+        .withColumn(
+            "departure_is_added",
+            (sf.col("dp_ps") == "a")
+            | (sf.col("dp_cs") == "a")
+            | sf.col("is_added_by_suffix"),
+        )
     )
 
 
 # ==================== RESOLVE LATEST STATE (for 3.2 & 3.3) ====================
 # TODO: save this to parquet instead of timetable/changes separately
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+
 def resolve_latest_stop_state(timetable_df, changes_df):
-    """Resolve the final observed state for each (station_eva, stop_id).
-
-    Corresponds to fact_changed.py chaining logic (L602–L636 + L644–L794):
-      - Base row = latest snapshot_key per (station_eva, stop_id)  (L602–L636)
-      - Overlay changed times onto planned baseline                (L728–L794)
-      - Added stops with no planned base → insert from change XML  (L665–L726)
-    Spark replaces the SQL DISTINCT ON with a Window row_number(),
-    and the per-row upsert with a DataFrame outer join + coalesce.
     """
-    # Latest change row per (station_eva, stop_id)
-    w = Window.partitionBy("station_eva", "stop_id").orderBy(sf.desc("snapshot_key"))
-    latest_changes = (
-        changes_df
-        .withColumn("_rn", sf.row_number().over(w))
-        .filter(sf.col("_rn") == 1)
-        .drop("_rn")
+    Resolve the latest state for each (stop_id, station_eva) pair.
+
+    This mirrors the logic in spark_etl_by_steps.py:get_last_values_for_stop()
+    which uses sf.last(col, ignorenulls=True) for ALL columns including cancellation.
+
+    Key differences from previous implementation:
+    1. Filter out NULL station_eva BEFORE resolution (matching spark_etl_by_steps.py line 441)
+    2. Use last(ignorenulls=True) for cancellation instead of max() - cancellation
+       should follow the same pattern as other columns
+    3. Preserve planned times from changes feed (ar_pt, dp_pt) since changes XML
+       also contains these values
+    """
+
+
+    # 1. Filter out NULL keys first
+    timetable_df = timetable_df.filter(
+        F.col("station_eva").isNotNull() & F.col("stop_id").isNotNull()
+    )
+    changes_df = changes_df.filter(
+        F.col("station_eva").isNotNull() & F.col("stop_id").isNotNull()
     )
 
-    # CORRECTION: dropDuplicates was non-deterministic so I'm switching to window ordering like efe's
-    w_planned = Window.partitionBy("station_eva", "stop_id").orderBy(
-        sf.desc("snapshot_key")
-    )
-
-    planned = (
-        timetable_df.select(
-            "station_eva",
-            "stop_id",
-            "station_name",
-            "category",
-            "train_number",
-            sf.col("snapshot_key"),  # for window ordering
-            sf.col("dp_pt").alias("planned_departure_ts"),
-            sf.col("ar_pt").alias("planned_arrival_ts"),
+    # 2. Normalize column names
+    timetable_df = (
+        timetable_df.withColumnRenamed("ar_pt", "planned_arrival_ts")
+        .withColumnRenamed("dp_pt", "planned_departure_ts")
+        .withColumn("planned_arrival_ts", F.col("planned_arrival_ts").cast("timestamp"))
+        .withColumn(
+            "planned_departure_ts", F.col("planned_departure_ts").cast("timestamp")
         )
-        .withColumn("_rn", sf.row_number().over(w_planned))
-        .filter(sf.col("_rn") == 1)
+    )
+
+    changes_df = (
+        changes_df.withColumnRenamed("ar_ct", "changed_arrival_ts")
+        .withColumnRenamed("dp_ct", "changed_departure_ts")
+        .withColumnRenamed("ar_pt", "planned_arrival_ts")
+        .withColumnRenamed("dp_pt", "planned_departure_ts")
+        .withColumn("changed_arrival_ts", F.col("changed_arrival_ts").cast("timestamp"))
+        .withColumn(
+            "changed_departure_ts", F.col("changed_departure_ts").cast("timestamp")
+        )
+        .withColumn("planned_arrival_ts", F.col("planned_arrival_ts").cast("timestamp"))
+        .withColumn(
+            "planned_departure_ts", F.col("planned_departure_ts").cast("timestamp")
+        )
+    )
+
+    # 3. Add missing columns so schemas match
+    planned_events = (
+        timetable_df.withColumn("changed_arrival_ts", F.lit(None).cast("timestamp"))
+        .withColumn("changed_departure_ts", F.lit(None).cast("timestamp"))
+        # cancellation is False for planned events, not NULL
+        .withColumn("arrival_cancelled", F.lit(False).cast("boolean"))
+        .withColumn("departure_cancelled", F.lit(False).cast("boolean"))
+        .withColumn("arrival_is_hidden", F.col("arrival_is_hidden").cast("boolean"))
+        .withColumn("departure_is_hidden", F.col("departure_is_hidden").cast("boolean"))
+    )
+
+    change_events = (
+        changes_df
+        .withColumn("station_name", F.col("station_name"))
+        .withColumn("category", F.col("category"))
+        .withColumn("train_number", F.col("train_number"))
+    )
+
+    # Columns that define stop state
+    common_cols = [
+        "station_eva",
+        "stop_id",
+        "snapshot_key",
+        "station_name",
+        "category",
+        "train_number",
+        "planned_arrival_ts",
+        "planned_departure_ts",
+        "changed_arrival_ts",
+        "changed_departure_ts",
+        "arrival_cancelled",
+        "departure_cancelled",
+        "arrival_is_hidden",
+        "departure_is_hidden",
+    ]
+
+    # CRITICAL: Filter changes-only stops that aren't marked as "added"
+    # A changes-only stop is one that exists in changes but NOT in timetables.
+    # These should only be kept if marked as added (arrival_is_added OR departure_is_added).
+    #
+    # Get the set of (stop_id, station_eva) from timetables
+    timetable_keys = planned_events.select("stop_id", "station_eva").distinct()
+
+    # Split change events into:
+    # 1. Updates to existing stops (have corresponding timetable entry) - keep all
+    # 2. New stops (no timetable entry) - only keep if marked as "added"
+    change_keys = change_events.select("stop_id", "station_eva").distinct()
+
+    # Changes that have a timetable entry - keep these
+    changes_with_timetable = change_events.join(
+        timetable_keys,
+        ["stop_id", "station_eva"],
+        "inner"
+    )
+
+    # Changes that DON'T have a timetable entry - only keep if "added"
+    changes_only = change_events.join(
+        timetable_keys,
+        ["stop_id", "station_eva"],
+        "left_anti"
+    )
+
+    # Filter changes-only to keep only "added" stops
+    if "arrival_is_added" in changes_df.columns and "departure_is_added" in changes_df.columns:
+        changes_only_added = changes_only.filter(
+            F.col("arrival_is_added") | F.col("departure_is_added")
+        )
+        log.info("Changes-only stops: %d total, %d marked as added (keeping only added)",
+                 changes_only.count(), changes_only_added.count())
+    else:
+        # Fallback if is_added columns don't exist
+        changes_only_added = changes_only
+        log.warning("is_added columns not found - keeping all changes-only stops")
+
+    # Combine: timetable events + changes with timetable + added-only changes
+    filtered_changes = changes_with_timetable.unionByName(changes_only_added)
+
+    events = planned_events.select(common_cols).unionByName(
+        filtered_changes.select(common_cols)
+    )
+
+
+    # 3. Carry forward last known non-null value per field
+
+    w_history = (
+        Window.partitionBy("stop_id", "station_eva")
+        .orderBy(F.col("snapshot_key").asc_nulls_first())
+        .rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+    )
+
+    w_latest = Window.partitionBy("stop_id", "station_eva").orderBy(
+        F.col("snapshot_key").desc_nulls_last()
+    )
+
+    normal_state_cols = [
+        "station_name",
+        "category",
+        "train_number",
+        "planned_arrival_ts",
+        "planned_departure_ts",
+        "changed_arrival_ts",
+        "changed_departure_ts",
+        "arrival_is_hidden",
+        "departure_is_hidden",
+    ]
+
+    # Apply last(ignorenulls=True) to ALL state columns including cancellation
+    # This matches spark_etl_by_steps.py:get_last_values_for_stop() which uses
+    # sf.last(col, ignorenulls=True) for all columns.
+    #
+    # CRITICAL FIX: Previously cancellation used F.max() which made it "cumulative"
+    # (once cancelled, always cancelled). But spark_etl_by_steps.py uses last()
+    # which takes the last non-null value. Since planned events set cancelled=False
+    # and only valid cancellations (cs='c' AND clt IS NOT NULL) set cancelled=True,
+    # using last() gives the correct behavior.
+    all_state_cols = normal_state_cols + ["arrival_cancelled", "departure_cancelled"]
+    for c in all_state_cols:
+        events = events.withColumn(c, F.last(c, ignorenulls=True).over(w_history))
+
+    resolved = (
+        events.withColumn("_rn", F.row_number().over(w_latest))
+        .filter(F.col("_rn") == 1)
         .drop("_rn", "snapshot_key")
     )
 
-    changed = latest_changes.select(
-        "station_eva", "stop_id",
-        sf.col("station_name").alias("ch_station_name"),
-        sf.col("category").alias("ch_category"),
-        sf.col("train_number").alias("ch_train_number"),
-        sf.col("dp_pt").alias("ch_planned_departure_ts"),
-        sf.col("dp_ct").alias("changed_departure_ts"),
-        sf.col("ar_pt").alias("ch_planned_arrival_ts"),
-        sf.col("ar_ct").alias("changed_arrival_ts"),
-        sf.col("departure_cancelled"),
-        sf.col("arrival_cancelled"),
-        sf.col("departure_is_hidden").alias("ch_departure_is_hidden"),
-        sf.col("arrival_is_hidden").alias("ch_arrival_is_hidden"),
+
+    # 4. Final derived fields
+    resolved = (
+        resolved.withColumn(
+            "actual_arrival_ts", F.coalesce("changed_arrival_ts", "planned_arrival_ts")
+        )
+        .withColumn(
+            "actual_departure_ts",
+            F.coalesce("changed_departure_ts", "planned_departure_ts"),
+        )
+        .withColumn("arrival_cancelled", F.coalesce("arrival_cancelled", F.lit(False)))
+        .withColumn(
+            "departure_cancelled", F.coalesce("departure_cancelled", F.lit(False))
+        )
+        .withColumn("arrival_is_hidden", F.coalesce("arrival_is_hidden", F.lit(False)))
+        .withColumn(
+            "departure_is_hidden", F.coalesce("departure_is_hidden", F.lit(False))
+        )
+    )
+    # Filter to keep only rows with meaningful data
+    # Note: spark_etl_by_steps.py doesn't have this filter, but it helps reduce noise
+    resolved = resolved.filter(
+        (F.col("actual_arrival_ts").isNotNull())
+        | (F.col("actual_departure_ts").isNotNull())
     )
 
-    merged = planned.join(changed, ["station_eva", "stop_id"], "outer")
+    # Final deduplication to ensure exactly one row per (stop_id, station_eva)
+    # This matches the behavior of spark_etl_by_steps.py:get_last_values_for_stop()
+    resolved = resolved.dropDuplicates(["stop_id", "station_eva"])
 
-    # Actual time = changed if available, else latest change planned (most
-    # authoritative), fall back to timetable planned as last resort.
-    return (
-        merged
-        .withColumn("actual_departure_ts",
-                     sf.coalesce("changed_departure_ts", "ch_planned_departure_ts",
-                                 "planned_departure_ts"))
-        .withColumn("actual_arrival_ts",
-                     sf.coalesce("changed_arrival_ts", "ch_planned_arrival_ts",
-                                 "planned_arrival_ts"))
-        .withColumn("station_name", sf.coalesce("ch_station_name", "station_name"))
-        .withColumn("category", sf.coalesce("ch_category", "category"))
-        .withColumn("train_number", sf.coalesce("ch_train_number", "train_number"))
-        # cf. fact_changed.py L751: carry forward cancellation; default False
-        .withColumn("departure_cancelled",
-                     sf.coalesce("departure_cancelled", sf.lit(False)))
-        .withColumn("arrival_cancelled",
-                     sf.coalesce("arrival_cancelled", sf.lit(False)))
-        .withColumn("departure_is_hidden",
-                     sf.coalesce("ch_departure_is_hidden", sf.lit(False)))
-        .withColumn("arrival_is_hidden",
-                     sf.coalesce("ch_arrival_is_hidden", sf.lit(False)))
-    )
+    return resolved
 
 
 # ==================== TASK 3.2 – Average daily delay ====================
@@ -623,11 +810,14 @@ def compute_average_daily_delay(resolved_df, start_date=None, end_date=None, sta
     """Average delay per station, excluding cancelled/hidden stops.
 
     Operates on resolved final state (one row per stop) so each train is
-    counted once.  delay = actual_time − planned_time in minutes.
+    counted once.  delay = changed_time − planned_time in minutes.
+
+    IMPORTANT: Delay is only computed when there's a changed time (ct).
+    If there's no change, the stop ran on time (or we don't know), so
+    delay is NULL, not 0.
 
     Corresponds to fact_changed.py: _delay_minutes() (L441–L445) applied
-    inside upsert_fact_movement_from_changes_snapshot() (L755–L762),
-    but computed here on the resolved final state rather than per-snapshot.
+    inside upsert_fact_movement_from_changes_snapshot() (L755–L762).
     """
     if start_date:
         resolved_df = resolved_df.filter(
@@ -636,44 +826,71 @@ def compute_average_daily_delay(resolved_df, start_date=None, end_date=None, sta
         )
     if end_date:
         resolved_df = resolved_df.filter(
-            sf.col("actual_arrival_ts") < sf.to_timestamp(sf.lit(end_date), "yyyy-MM-dd")
+            sf.col("actual_arrival_ts")
+            < sf.to_timestamp(sf.lit(end_date), "yyyy-MM-dd")
         )
     if station_eva:
         resolved_df = resolved_df.filter(sf.col("station_eva") == station_eva)
+
+    # CRITICAL FIX: Delay = changed_time - planned_time, NOT actual - planned
+    # Only compute delay when there's actually a changed time (ct).
+    # If changed_time is NULL, delay should be NULL (not 0).
+    # This matches Python fact_changed.py:_delay_minutes() which requires
+    # both planned and changed times to be non-NULL.
     df = resolved_df.withColumn(
         "arrival_delay_min",
         sf.when(
-            sf.col("actual_arrival_ts").isNotNull()
+            sf.col("changed_arrival_ts").isNotNull()
             & sf.col("planned_arrival_ts").isNotNull()
-            & ~sf.col("arrival_cancelled") & ~sf.col("arrival_is_hidden"),
-            (sf.unix_timestamp("actual_arrival_ts")
-             - sf.unix_timestamp("planned_arrival_ts")) / 60,
-        ).cast("int"),   # float??
+            & ~sf.col("arrival_cancelled")
+            & ~sf.col("arrival_is_hidden"),
+            sf.round(
+                (
+                    sf.unix_timestamp("changed_arrival_ts")
+                    - sf.unix_timestamp("planned_arrival_ts")
+                )
+                / 60.0
+            ),
+        ).cast("int"),
     ).withColumn(
         "departure_delay_min",
         sf.when(
-            sf.col("actual_departure_ts").isNotNull()
+            sf.col("changed_departure_ts").isNotNull()
             & sf.col("planned_departure_ts").isNotNull()
-            & ~sf.col("departure_cancelled") & ~sf.col("departure_is_hidden"),
-            (sf.unix_timestamp("actual_departure_ts")
-             - sf.unix_timestamp("planned_departure_ts")) / 60,
-        ).cast("int"),   # float??
+            & ~sf.col("departure_cancelled")
+            & ~sf.col("departure_is_hidden"),
+            sf.round(
+                (
+                    sf.unix_timestamp("changed_departure_ts")
+                    - sf.unix_timestamp("planned_departure_ts")
+                )
+                / 60.0
+            ),
+        ).cast("int"),
     )
 
-    avg_arr = (df.filter(sf.col("arrival_delay_min").isNotNull())
-               .groupBy("station_eva")
-               .agg(sf.avg("arrival_delay_min").alias("avg_arrival_delay_min")))
-    avg_dep = (df.filter(sf.col("departure_delay_min").isNotNull())
-               .groupBy("station_eva")
-               .agg(sf.avg("departure_delay_min").alias("avg_departure_delay_min")))
+    avg_arr = (
+        df.filter(sf.col("arrival_delay_min").isNotNull())
+        .groupBy("station_eva")
+        .agg(sf.round(sf.avg("arrival_delay_min"), 2).alias("avg_arrival_delay_min"))
+    )
+    avg_dep = (
+        df.filter(sf.col("departure_delay_min").isNotNull())
+        .groupBy("station_eva")
+        .agg(sf.round(sf.avg("departure_delay_min"), 2).alias("avg_departure_delay_min"))
+    )
 
     joined = avg_arr.join(avg_dep, "station_eva", "outer")
-    return joined.fillna({
-        "avg_arrival_delay_min": 0.0,
-        "avg_departure_delay_min": 0.0,
-    })
+    return joined.fillna(
+        {
+            "avg_arrival_delay_min": 0.0,
+            "avg_departure_delay_min": 0.0,
+        }
+    )
+
 
 # ==================== TASK 3.3 – Peak-hour departures ====================
+
 
 def compute_peak_hour_departure_counts(resolved_df):
     """Average number of departures per station during peak hours
@@ -684,12 +901,17 @@ def compute_peak_hour_departure_counts(resolved_df):
     """
     peak = resolved_df.filter(
         sf.col("actual_departure_ts").isNotNull()
-        & ~sf.col("departure_cancelled") & ~sf.col("departure_is_hidden")
+        & ~sf.col("departure_cancelled")
+        & ~sf.col("departure_is_hidden")
         & (
-            ((sf.hour("actual_departure_ts") >= 7)
-             & (sf.hour("actual_departure_ts") < 9))
-            | ((sf.hour("actual_departure_ts") >= 17)
-               & (sf.hour("actual_departure_ts") < 19))
+            (
+                (sf.hour("actual_departure_ts") >= 7)
+                & (sf.hour("actual_departure_ts") < 9)
+            )
+            | (
+                (sf.hour("actual_departure_ts") >= 17)
+                & (sf.hour("actual_departure_ts") < 19)
+            )
         )
     )
     daily = (
@@ -743,7 +965,9 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
     log.info("Transforming...")
     timetable_df = cast_timestamps(timetable_df, ["ar_pt", "dp_pt"])
     changes_df = derive_change_flags(
-        cast_timestamps(changes_df, ["ar_pt", "ar_ct", "dp_pt", "dp_ct"])
+        cast_timestamps(
+            changes_df, ["ar_pt", "ar_ct", "ar_clt", "dp_pt", "dp_ct", "dp_clt"]
+        )
     )
 
     # --- Task 3.1: Load ---
@@ -814,106 +1038,36 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
         .parquet("file:///opt/spark-data/movements/final_movements")
     )
     log.info("Final movements written (%.1fs)", time.time() - t_write)
-
+    final_count = final_output.count()
+    log.info("Final movements row count: %d", final_count)
     resolved.unpersist()
     log.info("All tasks complete (%.1fs wall time)", time.time() - t0)
-    spark.stop()
 
 
-def compare_backfill_station_eva(
-    spark,
-    station_data_path="/opt/spark-data/DBahn-berlin/station_data.json",
-    fuzzy_threshold=2,
-):
-    """Test backfill_station_eva with exact + token-level fuzzy matching.
+def compare_timetables_final(spark):
+    """Compare timetable DataFrame with final resolved movements."""
+    tt = spark.read.parquet("file:///opt/spark-data/movements/timetables")
+    final = spark.read.parquet("file:///opt/spark-data/movements/final_movements")
 
-    Args:
-        fuzzy_threshold: Maximum token set distance (default: 2 tokens difference)
-    """
-    test_distributed_write(spark, "file:///opt/spark-data/movements")
+    tt_count = tt.count()
+    final_count = final.count()
+    log.info("Timetable records: %d", tt_count)
+    log.info("Final resolved records: %d", final_count)
 
-    # Load station lookup
-    station_lookup_df = create_station_lookup_df(spark, station_data_path)
-    station_lookup_df.cache()
+    # Find timetable records not in final
+    tt_keys = tt.select("station_eva", "stop_id", "snapshot_key").distinct()
+    final_keys = final.select("station_eva", "stop_id").distinct()
 
-    # Load timetable data
-    timetable_df = extract(
-        spark,
-        "file:///opt/spark-data/timetables/*/*/*.xml",
-        parse_timetable_partition,
-        TIMETABLE_SCHEMA,
-        min_partitions=50,
-    )
-
-    initial_missing = timetable_df.filter(sf.col("station_eva").isNull()).count()
-    total_records = timetable_df.count()
-    log.info("Total timetable records: %d", total_records)
-    log.info("Initial records missing station_eva: %d", initial_missing)
-
-    # 1. Exact matching only
-    log.info("--- Stage 1: Exact matching ---")
-    result_exact = backfill_station_eva(
-        timetable_df, station_lookup_df, fuzzy_threshold=0
-    )
-    n_missing_exact = result_exact.filter(sf.col("station_eva").isNull()).count()
-    n_filled_exact = initial_missing - n_missing_exact
-    log.info(
-        "After exact match: %d filled, %d still missing",
-        n_filled_exact,
-        n_missing_exact,
-    )
-
-    # 2. Fuzzy matching on remaining 
-    log.info("--- Stage 2: Exact + Fuzzy matching (threshold=%d) ---", fuzzy_threshold)
-    result_fuzzy = backfill_station_eva(
-        timetable_df, station_lookup_df, fuzzy_threshold=fuzzy_threshold
-    )
-    n_missing_fuzzy = result_fuzzy.filter(sf.col("station_eva").isNull()).count()
-    n_filled_fuzzy = initial_missing - n_missing_fuzzy
-    n_fuzzy_recovered = n_missing_exact - n_missing_fuzzy
-    log.info(
-        "After fuzzy match: %d filled total, %d still missing",
-        n_filled_fuzzy,
-        n_missing_fuzzy,
-    )
-    log.info("Fuzzy matching recovered: %d additional records", n_fuzzy_recovered)
-
-    # --- Summary ---
-    log.info("=" * 60)
-    log.info("SUMMARY:")
-    log.info("  Total records:      %d", total_records)
-    log.info("  Initial missing:    %d", initial_missing)
-    log.info(
-        "  After exact match:  %d filled (%d missing)", n_filled_exact, n_missing_exact
-    )
-    log.info(
-        "  After fuzzy match:  %d filled (%d missing)", n_filled_fuzzy, n_missing_fuzzy
-    )
-    log.info("  Fuzzy recovered:    %d additional", n_fuzzy_recovered)
-    log.info("=" * 60)
-
-    # Show stations still missing
-    if n_missing_fuzzy > 0:
-        log.info("Stations still missing EVA (showing normalized names):")
-        _search_name_udf = sf.udf(to_station_search_name, StringType())
-        missing_stations = (
-            result_fuzzy.filter(sf.col("station_eva").isNull())
-            .select("station_name")
-            .distinct()
-            .withColumn("normalized", _search_name_udf("station_name"))
-        )
-        missing_stations.show(30, truncate=False)
-
-        # Also show what's in the lookup table for comparison
-        log.info("Station lookup table entries (for comparison):")
-        station_lookup_df.select("search_name", "ref_station_eva").show(
-            20, truncate=False
-        )
-
-    station_lookup_df.unpersist()
+    missing_in_final = tt_keys.join(final_keys, ["station_eva", "stop_id"], "left_anti")
+    missing_count = missing_in_final.count()
+    log.info("Timetable records missing in final: %d", missing_count)
+    if missing_count > 0:
+        missing_in_final.show(20, truncate=False)
 
 
 if __name__ == "__main__":
+    import sys
+
     spark = (
         SparkSession.builder.appName("Berlin Public Transport ETL")
         .master("spark://spark-master:7077")
@@ -923,8 +1077,13 @@ if __name__ == "__main__":
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    # compare_backfill_station_eva(spark)
-    main(spark)
+    # Check for command line args to run tests
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        log.info("Running diagnostic tests... Use spark_tests.py instead for more options.")
+        from spark_tests import run_all_diagnostic_tests
+        run_all_diagnostic_tests(spark)
+    else:
+        main(spark)
+
     spark.stop()
 
-    # main(spark)
