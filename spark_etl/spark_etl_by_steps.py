@@ -248,8 +248,8 @@ def add_station_eva_with_exact_then_fuzzy(df, dim_station_df, fuzzy_threshold=0.
 def main():
     timetables_root = os.getenv("TIMETABLES_ROOT", "/opt/spark-data/timetables")
     changes_root = os.getenv("CHANGES_ROOT", "/opt/spark-data/timetable_changes")
-    stations_parquet = os.getenv("STATIONS_PARQUET", "/opt/spark-data/dim_station")
-    out_all_logs = os.getenv("LOGS_OUT", "/opt/spark-data/logs")
+    stations_parquet = os.getenv("STATIONS_PARQUET", "/opt/spark-data/movements/dim_station")
+    out_all_logs = os.getenv("LOGS_OUT", "/opt/spark-data/logs/event_logs_parquet")
     movements_out = os.getenv("MOVEMENTS_OUT", "/opt/spark-data/movements")
 
     snapshot_keys_planned = sorted(set(iter_timetable_snapshots(timetables_root)))
