@@ -73,7 +73,7 @@ def get_avg_number_train_dep1(df):
     return avg_departure_by_station
 
 def get_daily_delay_averages(df, station):
-    station = to_station_search_name(station)
+    #station = to_station_search_name(station)
     df = df.withColumns({
             "arr_delay_min": sf.when(sf.col("planned_arrival_ts").isNull(), None)
                                .when(sf.col("changed_arrival_ts").isNotNull(), sf.floor((sf.unix_timestamp("changed_arrival_ts") - sf.unix_timestamp("planned_arrival_ts")) / 60))
@@ -83,7 +83,7 @@ def get_daily_delay_averages(df, station):
                                .otherwise(0)
         })
     
-    daily_delays = df.filter(sf.col('station') == station)\
+    daily_delays = df.filter(sf.col('station_eva') == station)\
         .filter(((sf.col('arr_delay_min').isNotNull()) & (sf.col('arr_delay_min') >= 0) & (~sf.col('arrival_cancelled')) & (~sf.col('arrival_is_hidden'))) | \
                 ((sf.col('dep_delay_min').isNotNull()) & (sf.col('dep_delay_min') >= 0) & (~sf.col('departure_cancelled')) & (~sf.col('departure_is_hidden')))) \
         .fillna(0, subset=['arr_delay_min', 'dep_delay_min']) \
@@ -112,6 +112,28 @@ def get_avg_number_train_dep(df):
     avg_departure_by_station = all_dep_and_station_pairs.join(departures_by_peak_hours, ['actual_dep_day', 'station'], 'left') \
         .fillna(0, 'dep_count') \
         .groupBy('station').avg('dep_count').withColumnRenamed('avg(dep_count)', 'avg_dep_count')
+    return avg_departure_by_station
+
+def compute_peak_hour_departure_counts(resolved_df):
+    """Average number of departures per station during peak hours
+    (07:00–09:00, 17:00–19:00), excluding cancelled/hidden departures.
+
+    Uses resolved final state: actual departure = changed if available, else planned.
+    No direct counterpart in fact_planned.py / fact_changed.py (query-only logic).
+    """
+    stations = resolved_df.select('station_eva').distinct()
+    peak = resolved_df.filter(
+        sf.col("actual_departure_ts").isNotNull()
+        & ~sf.col("departure_cancelled")
+        & ~sf.col("departure_is_hidden")) \
+        .withColumns({'actual_dep_hour': sf.hour(sf.col('actual_departure_ts')), 'actual_dep_day': sf.to_date(sf.col('actual_departure_ts'))})
+    dep_days = resolved_df.select('actual_dep_day').distinct()
+    all_dep_and_station_pairs = stations.crossJoin(dep_days)
+    departures_by_peak_hours = df.filter(sf.col('actual_dep_hour').isin([7,8,17,18]))
+    departures_by_peak_hours = departures_by_peak_hours.groupBy('station_eva', 'actual_dep_day').count().withColumnRenamed('count', 'dep_count')
+    avg_departure_by_station = all_dep_and_station_pairs.join(departures_by_peak_hours, ['actual_dep_day', 'station_eva'], 'left') \
+        .fillna(0, 'dep_count') \
+        .groupBy('station_eva').avg('dep_count').withColumnRenamed('avg(dep_count)', 'avg_dep_count')
     return avg_departure_by_station
 
 def main():
