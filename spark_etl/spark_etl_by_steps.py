@@ -169,11 +169,18 @@ def add_station_eva_with_exact_then_fuzzy(df, dim_station_df, fuzzy_threshold=0.
         .dropDuplicates(["station_name_search_dim"])
     )
 
-    df2 = df.withColumn("station_name_search", to_station_search_name_col(sf.col("station")))
+    df2 = df.withColumn(
+        "station_name_search",
+        to_station_search_name_col(sf.col("station")),
+    )
 
     # 1) exact join on normalized search name
     joined = (
-        df2.join(sf.broadcast(dim), df2.station_name_search == dim.station_name_search_dim, how="left")
+        df2.join(
+            sf.broadcast(dim),
+            df2.station_name_search == dim.station_name_search_dim,
+            how="left",
+        )
         .drop("station_name_search_dim")
         .withColumn("station_eva_exact", sf.col("station_eva_dim").cast("long"))
         .drop("station_eva_dim")
@@ -181,7 +188,10 @@ def add_station_eva_with_exact_then_fuzzy(df, dim_station_df, fuzzy_threshold=0.
 
     # prefer existing station_eva if already present (e.g., changes feed might provide it)
     if "station_eva" in joined.columns:
-        joined = joined.withColumn("station_eva_pref", sf.coalesce(sf.col("station_eva").cast("long"), sf.col("station_eva_exact")))
+        joined = joined.withColumn(
+            "station_eva_pref",
+            sf.coalesce(sf.col("station_eva").cast("long"), sf.col("station_eva_exact")),
+        )
     else:
         joined = joined.withColumn("station_eva_pref", sf.col("station_eva_exact"))
 
@@ -189,39 +199,69 @@ def add_station_eva_with_exact_then_fuzzy(df, dim_station_df, fuzzy_threshold=0.
     unresolved_keys = (
         joined.filter(sf.col("station_eva_pref").isNull())
         .select("station_name_search")
-        .where(sf.col("station_name_search").isNotNull() & (sf.length("station_name_search") > 0))
+        .where(
+            sf.col("station_name_search").isNotNull()
+            & (sf.length(sf.col("station_name_search")) > 0)
+        )
         .dropDuplicates(["station_name_search"])
     )
 
-    # If there are no unresolved keys, short-circuit
-    # (Spark will optimize this away; keeping simple)
+    # tokenize + pick a single match token (string!)
+    generic_arr_sql = ",".join(repr(x) for x in GENERIC)
+
     unresolved_tok = (
         unresolved_keys.withColumn("tokens", sf.split(sf.col("station_name_search"), r"\s+"))
         .withColumn(
             "core_tokens",
             sf.expr(
-                f"filter(tokens, t -> length(t) >= 2 AND NOT array_contains(array({','.join([repr(x) for x in GENERIC])}), t))"
+                f"filter(tokens, t -> length(t) >= 2 AND NOT array_contains(array({generic_arr_sql}), t))"
             ),
         )
-        .withColumn("match_token", sf.when(sf.size("core_tokens") > 0, sf.col("core_tokens")[0]).otherwise(sf.col("tokens")[0]))
+        # choose the first "core" token if possible, else first token
+        .withColumn(
+            "match_token",
+            sf.when(sf.size(sf.col("core_tokens")) > 0, sf.element_at(sf.col("core_tokens"), 1))
+            .otherwise(sf.element_at(sf.col("tokens"), 1)),
+        )
         .select("station_name_search", "match_token")
+        .where(sf.col("match_token").isNotNull() & (sf.length(sf.col("match_token")) > 0))
     )
 
     # candidate restriction: dim rows containing match_token
+    # (IMPORTANT: use sf.col(...) so Spark sees columns, not Python attribute access)
     candidates = unresolved_tok.join(
         sf.broadcast(dim),
-        sf.instr(dim.station_name_search_dim, unresolved_tok.match_token) > 0,
+        sf.expr("instr(station_name_search_dim, match_token) > 0"),
         how="inner",
     )
 
     # normalized Levenshtein similarity
     scored = (
-        candidates.withColumn("dist", sf.levenshtein(sf.col("station_name_search"), sf.col("station_name_search_dim")))
-        .withColumn("max_len", sf.greatest(sf.length("station_name_search"), sf.length("station_name_search_dim")))
-        .withColumn("score", sf.when(sf.col("max_len") > 0, 1.0 - (sf.col("dist") / sf.col("max_len"))).otherwise(sf.lit(0.0)))
+        candidates.withColumn(
+            "dist",
+            sf.levenshtein(sf.col("station_name_search"), sf.col("station_name_search_dim")),
+        )
+        .withColumn(
+            "max_len",
+            sf.greatest(
+                sf.length(sf.col("station_name_search")),
+                sf.length(sf.col("station_name_search_dim")),
+            ),
+        )
+        .withColumn(
+            "score",
+            sf.when(
+                sf.col("max_len") > 0,
+                1.0 - (sf.col("dist") / sf.col("max_len")),
+            ).otherwise(sf.lit(0.0)),
+        )
     )
 
-    w = Window.partitionBy("station_name_search").orderBy(sf.col("score").desc(), sf.col("dist").asc())
+    w = Window.partitionBy("station_name_search").orderBy(
+        sf.col("score").desc(),
+        sf.col("dist").asc(),
+    )
+
     best = (
         scored.withColumn("rn", sf.row_number().over(w))
         .filter(sf.col("rn") == 1)
@@ -234,9 +274,16 @@ def add_station_eva_with_exact_then_fuzzy(df, dim_station_df, fuzzy_threshold=0.
     )
 
     out = (
-        joined.join(sf.broadcast(best), joined.station_name_search == best.station_name_search_map, how="left")
+        joined.join(
+            sf.broadcast(best),
+            joined.station_name_search == best.station_name_search_map,
+            how="left",
+        )
         .drop("station_name_search_map")
-        .withColumn("station_eva", sf.coalesce(sf.col("station_eva_pref"), sf.col("station_eva_fuzzy")).cast("long"))
+        .withColumn(
+            "station_eva",
+            sf.coalesce(sf.col("station_eva_pref"), sf.col("station_eva_fuzzy")).cast("long"),
+        )
         .drop("station_eva_pref", "station_eva_exact")  # keep station_eva_fuzzy_score if you want to inspect
     )
 
@@ -372,7 +419,7 @@ def main():
         print(f"[ETL] snapshot={key}")
 
         if key in snapshot_keys_planned:
-            path_to_timetable = f"{timetables_root}/{key}/*.xml"
+            path_to_timetable = f"{timetables_root}/**/{key}/*.xml"
             timetable_df = extract_data_from_xml(spark, path_to_timetable, timetableSchema)
             timetable_df = flatten_df(timetable_df, flatten_mapping_planned_fields)
             timetable_df = (
@@ -442,7 +489,8 @@ def main():
 
     keys = ["stop_id", "station_eva"]
     order = "snapshot_ts"
-    left_cols = [c for c in events.columns if c not in keys + ["snapshot_date"]]
+    #left_cols = [c for c in events.columns if c not in keys + ["snapshot_date"]]
+    left_cols = [c for c in events.columns if c not in keys]
 
     movement_df = get_last_values_for_stop(events, order, keys, left_cols)
 
