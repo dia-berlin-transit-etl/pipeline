@@ -1,9 +1,10 @@
+# spark_etl/stations.py
 from pyspark.sql import SparkSession, functions as F
 
 spark = SparkSession.builder.appName("Station JSON -> dim_station parquet").getOrCreate()
 
-station_json_path = "./station_data.json"
-out_parquet_path = "./spark-data/dim_station"
+station_json_path = "/opt/spark-data/station_data.json"
+out_parquet_path = "/opt/spark-data/movements/dim_station"
 
 raw = spark.read.option("multiLine", True).json(station_json_path)
 
