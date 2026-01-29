@@ -805,10 +805,18 @@ def test_compute_average_daily_delay(spark):
         log.info("Departure delay (min): min=%.2f, max=%.2f, avg=%.2f",
                  stats["min_dep"] or 0, stats["max_dep"] or 0, stats["avg_dep"] or 0)
 
-        # Sample top 10 delayed stations
+        # Sample top 10 delayed stations - join with final to get station names
         log.info("")
         log.info("Top 10 stations by average arrival delay:")
-        delay_df.orderBy(F.col("avg_arrival_delay_min").desc()).show(10, truncate=False)
+        station_names = final.select("station_eva", "station_name").distinct()
+        (
+            delay_df.join(station_names, "station_eva", "left")
+            .orderBy(F.col("avg_arrival_delay_min").desc())
+            .limit(10)
+            .withColumn("row", F.monotonically_increasing_id() + 1)
+            .select("row", "station_eva", "station_name", "avg_arrival_delay_min", "avg_departure_delay_min")
+            .show(10, truncate=False)
+        )
 
         # Verify delay calculation logic: manually compute for a sample
         log.info("")
@@ -831,20 +839,24 @@ def test_compute_average_daily_delay(spark):
             F.round(
                 (F.unix_timestamp("changed_arrival_ts") - F.unix_timestamp("planned_arrival_ts")) / 60.0
             )
-        )
+        ).withColumn("row", F.monotonically_increasing_id() + 1).select("row", "*")
         log.info("Sample delay calculations (manual):")
         sample_with_delay.show(5, truncate=False)
 
         # Verify: rows without changed_time should NOT contribute to delay
         log.info("")
         log.info("=== VERIFICATION: No-change rows should have NULL delay ===")
-        no_change_sample = final.filter(
-            F.col("changed_arrival_ts").isNull()
-            & F.col("planned_arrival_ts").isNotNull()
-        ).select(
-            "station_eva", "stop_id",
-            "planned_arrival_ts", "changed_arrival_ts", "actual_arrival_ts"
-        ).limit(5)
+        no_change_sample = (
+            final.filter(
+                F.col("changed_arrival_ts").isNull()
+                & F.col("planned_arrival_ts").isNotNull()
+            ).select(
+                "station_eva", "stop_id",
+                "planned_arrival_ts", "changed_arrival_ts", "actual_arrival_ts"
+            ).limit(5)
+            .withColumn("row", F.monotonically_increasing_id() + 1)
+            .select("row", "*")
+        )
         log.info("Sample rows without changed_arrival_ts (delay should be NULL, not 0):")
         no_change_sample.show(5, truncate=False)
 
@@ -889,7 +901,11 @@ def test_compute_peak_hour_departure_counts(spark):
         & ~F.col("departure_is_hidden")
     ).withColumn("hour", F.hour("actual_departure_ts"))
 
-    hour_dist = departures_with_hour.groupBy("hour").count().orderBy("hour")
+    hour_dist = (
+        departures_with_hour.groupBy("hour").count().orderBy("hour")
+        .withColumn("row", F.monotonically_increasing_id() + 1)
+        .select("row", "*")
+    )
     log.info("Departures by hour (non-cancelled, non-hidden):")
     hour_dist.show(24, truncate=False)
 
@@ -927,10 +943,18 @@ def test_compute_peak_hour_departure_counts(spark):
         log.info("Avg peak departures/day: min=%.2f, max=%.2f, overall_avg=%.2f",
                  stats["min_avg"] or 0, stats["max_avg"] or 0, stats["overall_avg"] or 0)
 
-        # Top 10 busiest stations during peak hours
+        # Top 10 busiest stations during peak hours - join to get station names
         log.info("")
         log.info("Top 10 busiest stations during peak hours:")
-        peak_df.orderBy(F.col("avg_peak_hour_departures_per_day").desc()).show(10, truncate=False)
+        station_names = final.select("station_eva", "station_name").distinct()
+        (
+            peak_df.join(station_names, "station_eva", "left")
+            .orderBy(F.col("avg_peak_hour_departures_per_day").desc())
+            .limit(10)
+            .withColumn("row", F.monotonically_increasing_id() + 1)
+            .select("row", "station_eva", "station_name", "avg_peak_hour_departures_per_day")
+            .show(10, truncate=False)
+        )
 
         # Verify: no off-peak hours are included
         log.info("")
@@ -951,9 +975,13 @@ def test_compute_peak_hour_departure_counts(spark):
             )
 
             # Group by date
-            daily_counts = station_peak.withColumn(
-                "dep_date", F.to_date("actual_departure_ts")
-            ).groupBy("dep_date").count().orderBy("dep_date")
+            daily_counts = (
+                station_peak.withColumn(
+                    "dep_date", F.to_date("actual_departure_ts")
+                ).groupBy("dep_date").count().orderBy("dep_date")
+                .withColumn("row", F.monotonically_increasing_id() + 1)
+                .select("row", "*")
+            )
 
             log.info("Daily peak departures for station %d:", station_eva)
             daily_counts.show(10, truncate=False)
@@ -1133,7 +1161,159 @@ def test_delay_only_with_changed_time(spark):
     }
 
 
-def test_unresolved_station_matches(spark, station_data_path=None):
+def test_alexanderplatz_delay(spark):
+    """
+    TEST 14: Verify delay calculation for Alexanderplatz station.
+
+    Alexanderplatz (EVA 8011155) is a major station with high traffic.
+    This test checks:
+    1. Delay values are reasonable (not inflated)
+    2. On-time trains (no changed_ts) count as 0 delay
+    3. The average delay is in a sensible range (typically < 10 min)
+    """
+    ALEXANDERPLATZ_EVA = 8011155
+
+    log.info("=" * 60)
+    log.info("TEST 14: Alexanderplatz delay verification")
+    log.info("=" * 60)
+
+    final = spark.read.parquet("file:///opt/spark-data/movements/final_movements")
+
+    # Filter to Alexanderplatz only
+    alex = final.filter(F.col("station_eva") == ALEXANDERPLATZ_EVA)
+    alex.cache()
+
+    total_stops = alex.count()
+    log.info("Total stops at Alexanderplatz: %d", total_stops)
+
+    if total_stops == 0:
+        log.warning("No data for Alexanderplatz (EVA %d)", ALEXANDERPLATZ_EVA)
+        return {"status": "NO_DATA", "station_eva": ALEXANDERPLATZ_EVA}
+
+    # Count arrivals/departures
+    has_arrival = alex.filter(F.col("planned_arrival_ts").isNotNull()).count()
+    has_departure = alex.filter(F.col("planned_departure_ts").isNotNull()).count()
+    log.info("Stops with planned arrival: %d", has_arrival)
+    log.info("Stops with planned departure: %d", has_departure)
+
+    # Count changed times (actual delays)
+    has_changed_arr = alex.filter(F.col("changed_arrival_ts").isNotNull()).count()
+    has_changed_dep = alex.filter(F.col("changed_departure_ts").isNotNull()).count()
+    log.info("Stops with changed arrival (delayed): %d (%.1f%%)",
+             has_changed_arr, 100.0 * has_changed_arr / has_arrival if has_arrival else 0)
+    log.info("Stops with changed departure (delayed): %d (%.1f%%)",
+             has_changed_dep, 100.0 * has_changed_dep / has_departure if has_departure else 0)
+
+    # Count cancelled/hidden
+    arr_cancelled = alex.filter(F.col("arrival_cancelled")).count()
+    dep_cancelled = alex.filter(F.col("departure_cancelled")).count()
+    arr_hidden = alex.filter(F.col("arrival_is_hidden")).count()
+    dep_hidden = alex.filter(F.col("departure_is_hidden")).count()
+    log.info("Arrivals cancelled: %d, hidden: %d", arr_cancelled, arr_hidden)
+    log.info("Departures cancelled: %d, hidden: %d", dep_cancelled, dep_hidden)
+
+    # Compute delay using the function
+    delay_df = compute_average_daily_delay(final, station_eva=ALEXANDERPLATZ_EVA)
+    delay_row = delay_df.collect()
+
+    if delay_row:
+        avg_arr_delay = delay_row[0]["avg_arrival_delay_min"]
+        avg_dep_delay = delay_row[0]["avg_departure_delay_min"]
+        log.info("")
+        log.info("=== COMPUTED AVERAGE DELAYS ===")
+        log.info("Average arrival delay: %.2f min", avg_arr_delay or 0)
+        log.info("Average departure delay: %.2f min", avg_dep_delay or 0)
+
+        # Sanity check: average delay should be reasonable (< 15 min typically)
+        if avg_arr_delay and avg_arr_delay > 15:
+            log.warning("WARNING: Average arrival delay %.2f min seems high!", avg_arr_delay)
+        if avg_dep_delay and avg_dep_delay > 15:
+            log.warning("WARNING: Average departure delay %.2f min seems high!", avg_dep_delay)
+    else:
+        avg_arr_delay = None
+        avg_dep_delay = None
+        log.warning("No delay data returned for Alexanderplatz")
+
+    # Manual verification: compute delay breakdown
+    log.info("")
+    log.info("=== DELAY DISTRIBUTION ===")
+
+    # Compute individual delays
+    alex_with_delay = alex.filter(
+        F.col("planned_arrival_ts").isNotNull()
+        & ~F.col("arrival_cancelled")
+        & ~F.col("arrival_is_hidden")
+    ).withColumn(
+        "arr_delay_min",
+        F.coalesce(
+            F.round((F.unix_timestamp("changed_arrival_ts") - F.unix_timestamp("planned_arrival_ts")) / 60.0),
+            F.lit(0)
+        )
+    )
+
+    # Show delay distribution
+    delay_stats = alex_with_delay.agg(
+        F.count("*").alias("total"),
+        F.sum(F.when(F.col("arr_delay_min") == 0, 1).otherwise(0)).alias("on_time"),
+        F.sum(F.when(F.col("arr_delay_min") > 0, 1).otherwise(0)).alias("late"),
+        F.sum(F.when(F.col("arr_delay_min") < 0, 1).otherwise(0)).alias("early"),
+        F.min("arr_delay_min").alias("min_delay"),
+        F.max("arr_delay_min").alias("max_delay"),
+        F.avg("arr_delay_min").alias("avg_delay"),
+    ).collect()[0]
+
+    log.info("Total valid arrivals (denominator): %d", delay_stats["total"])
+    log.info("  - On-time (0 delay): %d (%.1f%%)",
+             delay_stats["on_time"],
+             100.0 * delay_stats["on_time"] / delay_stats["total"] if delay_stats["total"] else 0)
+    log.info("  - Late (delay > 0): %d (%.1f%%)",
+             delay_stats["late"],
+             100.0 * delay_stats["late"] / delay_stats["total"] if delay_stats["total"] else 0)
+    log.info("  - Early (delay < 0): %d (%.1f%%)",
+             delay_stats["early"],
+             100.0 * delay_stats["early"] / delay_stats["total"] if delay_stats["total"] else 0)
+    log.info("Delay range: %.0f to %.0f min", delay_stats["min_delay"] or 0, delay_stats["max_delay"] or 0)
+    log.info("")
+    log.info("Manual avg delay = sum(delays) / %d = %.2f min",
+             delay_stats["total"], delay_stats["avg_delay"] or 0)
+
+    # Verify compute_average_daily_delay matches manual calculation
+    if avg_arr_delay is not None and delay_stats["avg_delay"] is not None:
+        if abs(avg_arr_delay - delay_stats["avg_delay"]) < 0.1:
+            log.info("PASS: compute_average_daily_delay matches manual calculation")
+        else:
+            log.warning("FAIL: compute_average_daily_delay (%.2f) != manual (%.2f)",
+                       avg_arr_delay, delay_stats["avg_delay"])
+
+    # Show sample of delayed trains
+    log.info("")
+    log.info("=== SAMPLE OF DELAYED ARRIVALS ===")
+    (
+        alex_with_delay.filter(F.col("arr_delay_min") > 0).select(
+            "stop_id", "category", "train_number",
+            "planned_arrival_ts", "changed_arrival_ts", "arr_delay_min"
+        ).orderBy(F.col("arr_delay_min").desc())
+        .limit(10)
+        .withColumn("row", F.monotonically_increasing_id() + 1)
+        .select("row", "*")
+        .show(10, truncate=False)
+    )
+
+    alex.unpersist()
+
+    return {
+        "station_eva": ALEXANDERPLATZ_EVA,
+        "total_stops": total_stops,
+        "has_changed_arr": has_changed_arr,
+        "has_changed_dep": has_changed_dep,
+        "avg_arrival_delay_min": avg_arr_delay,
+        "avg_departure_delay_min": avg_dep_delay,
+        "on_time_count": delay_stats["on_time"],
+        "late_count": delay_stats["late"],
+    }
+
+
+def test_unresolved_station_matches(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.json"):
     """
     TEST 13: Show fuzzy matching attempts for unresolved station names.
 
@@ -1152,7 +1332,6 @@ def test_unresolved_station_matches(spark, station_data_path=None):
     log.info("=" * 60)
 
     from pyspark.sql.types import DoubleType
-    import os
     # Note: to_station_search_name, normalized_edit_distance, token_jaccard_similarity
     # are defined locally at the top of this file to avoid UDF serialization issues
 
@@ -1171,76 +1350,31 @@ def test_unresolved_station_matches(spark, station_data_path=None):
         log.info("PASS: All station names were resolved!")
         return {"unresolved_count": 0, "matches": []}
 
-    # FIRST: Print the unresolved station names (this works without the lookup file)
-    log.info("")
-    log.info("=== UNRESOLVED STATION NAMES ===")
-    _search_name_udf = sf.udf(to_station_search_name, StringType())
-    unresolved_with_norm = unresolved.withColumn(
-        "normalized_name", _search_name_udf(F.col("station_name"))
-    )
-    unresolved_rows = unresolved_with_norm.collect()
-    for row in unresolved_rows:
-        log.info("  UNRESOLVED: '%s' -> normalized: '%s'",
-                 row["station_name"], row["normalized_name"])
-
-    # Try multiple paths for station_data.json
-    possible_paths = [
-        station_data_path,
-        "/opt/spark-data/DBahn-berlin/station_data.json",
-        "/opt/spark-data/station_data.json",
-        "/opt/spark-apps/station_data.json",
-        "station_data.json",
-    ]
-
     # Load station lookup table
     import json
-    station_data = None
-    used_path = None
+    try:
+        with open(station_data_path, "r") as f:
+            station_data = json.load(f)
 
-    for path in possible_paths:
-        if path is None:
-            continue
-        try:
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    station_data = json.load(f)
-                used_path = path
-                log.info("Loaded station_data.json from: %s", path)
-                break
-        except Exception as e:
-            log.debug("Failed to load from %s: %s", path, e)
-            continue
+        # Build lookup DataFrame
+        lookup_rows = []
+        for eva_str, info in station_data.items():
+            try:
+                eva = int(eva_str)
+                name = info.get("name", "")
+                search_name = to_station_search_name(name)
+                if search_name:
+                    lookup_rows.append((search_name, eva, name))
+            except (ValueError, TypeError):
+                continue
 
-    if station_data is None:
-        log.warning("Could not find station_data.json in any of the expected paths.")
-        log.warning("Tried: %s", [p for p in possible_paths if p])
-        log.info("Skipping fuzzy match comparison. See unresolved station names above.")
-        return {
-            "unresolved_count": unresolved_count,
-            "unresolved_names": [row["station_name"] for row in unresolved_rows],
-            "error": "station_data.json not found",
-        }
-
-    # Build lookup DataFrame
-    lookup_rows = []
-    for eva_str, info in station_data.items():
-        try:
-            eva = int(eva_str)
-            name = info.get("name", "")
-            search_name = to_station_search_name(name)
-            if search_name:
-                lookup_rows.append((search_name, eva, name))
-        except (ValueError, TypeError):
-            continue
-
-    if not lookup_rows:
-        log.error("No valid stations found in station_data.json")
-        return {"unresolved_count": unresolved_count, "error": "empty lookup table"}
-
-    station_lookup_df = spark.createDataFrame(
-        lookup_rows, ["search_name", "ref_station_eva", "ref_station_name"]
-    )
-    log.info("Loaded %d stations from lookup table", station_lookup_df.count())
+        station_lookup_df = spark.createDataFrame(
+            lookup_rows, ["search_name", "ref_station_eva", "ref_station_name"]
+        )
+        log.info("Loaded %d stations from lookup table", station_lookup_df.count())
+    except Exception as e:
+        log.error("Failed to load station_data.json: %s", e)
+        return {"error": str(e)}
 
     # Create UDFs for distance calculation
     _search_name_udf = sf.udf(to_station_search_name, StringType())
@@ -1393,6 +1527,7 @@ def run_all_diagnostic_tests(spark):
     results["test_11_peak_hour"] = test_compute_peak_hour_departure_counts(spark)
     results["test_12_delay_bug_fix"] = test_delay_only_with_changed_time(spark)
     results["test_13_unresolved_matches"] = test_unresolved_station_matches(spark)
+    results["test_14_alexanderplatz"] = test_alexanderplatz_delay(spark)
 
     log.info("\n" + "=" * 70)
     log.info("DIAGNOSTIC SUMMARY")
@@ -1419,6 +1554,7 @@ TEST_MAP = {
     "test_11": test_compute_peak_hour_departure_counts,
     "test_12": test_delay_only_with_changed_time,
     "test_13": test_unresolved_station_matches,
+    "test_14": test_alexanderplatz_delay,
     "all": run_all_diagnostic_tests,
 }
 

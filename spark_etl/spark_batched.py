@@ -769,54 +769,92 @@ def resolve_latest_stop_state(timetable_df, changes_df):
 
 
 # ==================== TASK 3.2 – Average daily delay ====================
+
+
 def compute_average_daily_delay(
-    changes_df, start_date=None, end_date=None, station_eva=None
+    resolved_df, start_date=None, end_date=None, station_eva=None
 ):
-    df = changes_df
+    """Average delay per station, excluding cancelled/hidden stops.
 
-    # choose a service timestamp for filtering (ct if present else pt)
-    ar_service = sf.coalesce(sf.col("ar_ct"), sf.col("ar_pt"))
-    dp_service = sf.coalesce(sf.col("dp_ct"), sf.col("dp_pt"))
+    Operates on resolved final state (one row per stop) so each train is
+    counted once.  delay = changed_time − planned_time in minutes.
 
-    df = df.withColumn("service_date", sf.to_date(sf.coalesce(ar_service, dp_service)))
+    IMPORTANT: Delay is only computed when there's a changed time (ct).
+    If there's no change, the stop ran on time (or we don't know), so
+    delay is NULL, not 0.
 
+    Corresponds to fact_changed.py: _delay_minutes() (L441–L445) applied
+    inside upsert_fact_movement_from_changes_snapshot() (L755–L762).
+    """
     if start_date:
-        df = df.filter(sf.col("service_date") >= sf.lit(start_date))
+        resolved_df = resolved_df.filter(
+            sf.col("actual_arrival_ts")
+            >= sf.to_timestamp(sf.lit(start_date), "yyyy-MM-dd")
+        )
     if end_date:
-        df = df.filter(sf.col("service_date") < sf.lit(end_date))
+        resolved_df = resolved_df.filter(
+            sf.col("actual_arrival_ts")
+            < sf.to_timestamp(sf.lit(end_date), "yyyy-MM-dd")
+        )
     if station_eva:
-        df = df.filter(sf.col("station_eva") == sf.lit(station_eva))
+        resolved_df = resolved_df.filter(sf.col("station_eva") == station_eva)
 
-    # delay only when ct exists; baseline is pt from same row
-    df = df.withColumn(
+    # CRITICAL FIX: Delay = changed_time - planned_time, NOT actual - planned
+    # Only compute delay when there's actually a changed time (ct).
+    # If changed_time is NULL, delay should be NULL (not 0).
+    # This matches Python fact_changed.py:_delay_minutes() which requires
+    # both planned and changed times to be non-NULL.
+    df = resolved_df.withColumn(
         "arrival_delay_min",
         sf.when(
-            sf.col("ar_ct").isNotNull()
-            & sf.col("ar_pt").isNotNull()
+            sf.col("changed_arrival_ts").isNotNull()
+            & sf.col("planned_arrival_ts").isNotNull()
             & ~sf.col("arrival_cancelled")
             & ~sf.col("arrival_is_hidden"),
-            (sf.col("ar_ct").cast("long") - sf.col("ar_pt").cast("long")) / 60.0,
-        ),
+            sf.round(
+                (
+                    sf.unix_timestamp("changed_arrival_ts")
+                    - sf.unix_timestamp("planned_arrival_ts")
+                )
+                / 60.0
+            ),
+        ).cast("int"),
     ).withColumn(
         "departure_delay_min",
         sf.when(
-            sf.col("dp_ct").isNotNull()
-            & sf.col("dp_pt").isNotNull()
+            sf.col("changed_departure_ts").isNotNull()
+            & sf.col("planned_departure_ts").isNotNull()
             & ~sf.col("departure_cancelled")
             & ~sf.col("departure_is_hidden"),
-            (sf.col("dp_ct").cast("long") - sf.col("dp_pt").cast("long")) / 60.0,
-        ),
+            sf.round(
+                (
+                    sf.unix_timestamp("changed_departure_ts")
+                    - sf.unix_timestamp("planned_departure_ts")
+                )
+                / 60.0
+            ),
+        ).cast("int"),
     )
 
-    # if you truly mean "average daily delay": average per day, then average those
-    daily = df.groupBy("station_eva", "service_date").agg(
-        sf.avg("arrival_delay_min").alias("daily_avg_arrival_delay_min"),
-        sf.avg("departure_delay_min").alias("daily_avg_departure_delay_min"),
+    avg_arr = (
+        df.filter(sf.col("arrival_delay_min").isNotNull())
+        .groupBy("station_eva")
+        .agg(sf.round(sf.avg("arrival_delay_min"), 2).alias("avg_arrival_delay_min"))
+    )
+    avg_dep = (
+        df.filter(sf.col("departure_delay_min").isNotNull())
+        .groupBy("station_eva")
+        .agg(
+            sf.round(sf.avg("departure_delay_min"), 2).alias("avg_departure_delay_min")
+        )
     )
 
-    return daily.groupBy("station_eva").agg(
-        sf.avg("daily_avg_arrival_delay_min").alias("avg_daily_arrival_delay_min"),
-        sf.avg("daily_avg_departure_delay_min").alias("avg_daily_departure_delay_min"),
+    joined = avg_arr.join(avg_dep, "station_eva", "outer")
+    return joined.fillna(
+        {
+            "avg_arrival_delay_min": 0.0,
+            "avg_departure_delay_min": 0.0,
+        }
     )
 
 
@@ -829,28 +867,42 @@ def compute_peak_hour_departure_counts(resolved_df):
 
     Uses resolved final state: actual departure = changed if available, else planned.
     No direct counterpart in fact_planned.py / fact_changed.py (query-only logic).
+
+    Days with no peak hour departures count as 0 (not omitted from average).
     """
-    peak = resolved_df.filter(
+    # Get all valid departures (not cancelled, not hidden)
+    valid_departures = resolved_df.filter(
         sf.col("actual_departure_ts").isNotNull()
         & ~sf.col("departure_cancelled")
         & ~sf.col("departure_is_hidden")
-        & (
-            (
-                (sf.hour("actual_departure_ts") >= 7)
-                & (sf.hour("actual_departure_ts") < 9)
-            )
-            | (
-                (sf.hour("actual_departure_ts") >= 17)
-                & (sf.hour("actual_departure_ts") < 19)
-            )
+    ).withColumn("dep_date", sf.to_date("actual_departure_ts"))
+
+    # Get all (station_eva, date) combinations with any departure
+    all_station_dates = valid_departures.select("station_eva", "dep_date").distinct()
+
+    # Filter to peak hours only
+    peak = valid_departures.filter(
+        (
+            (sf.hour("actual_departure_ts") >= 7)
+            & (sf.hour("actual_departure_ts") < 9)
+        )
+        | (
+            (sf.hour("actual_departure_ts") >= 17)
+            & (sf.hour("actual_departure_ts") < 19)
         )
     )
-    daily = (
-        peak.withColumn("dep_date", sf.to_date("actual_departure_ts"))
-        .groupBy("station_eva", "dep_date")
-        .agg(sf.count("*").alias("daily_departure_count"))
+
+    # Count peak departures per station per day
+    peak_daily = peak.groupBy("station_eva", "dep_date").agg(
+        sf.count("*").alias("daily_departure_count")
     )
-    return daily.groupBy("station_eva").agg(
+
+    # Left join to include days with 0 peak departures
+    daily_with_zeros = all_station_dates.join(
+        peak_daily, ["station_eva", "dep_date"], "left"
+    ).fillna(0, subset=["daily_departure_count"])
+
+    return daily_with_zeros.groupBy("station_eva").agg(
         sf.avg("daily_departure_count").alias("avg_peak_hour_departures_per_day")
     )
 
@@ -934,23 +986,6 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
     resolved_count = resolved.count()  # materialize once for both 3.2 and 3.3
     log.info("Resolved %d stop states (%.1fs)", resolved_count, time.time() - t1)
 
-    # --- Task 3.2 ---
-    # TODO: assert avg_arrival_delay_min/avg_departure_delay_min type as minutes
-    log.info("Task 3.2 – Computing average daily delay per station...")
-    t1 = time.time()
-    avg_delay = compute_average_daily_delay(
-        resolved, start_date="2025-10-04", end_date="2025-10-07", station_eva=8011162
-    )
-    avg_delay.show(10)
-    log.info("Task 3.2 complete (%.1fs)", time.time() - t1)
-
-    # --- Task 3.3 ---
-    log.info("Task 3.3 – Computing average peak-hour departures per station...")
-    t1 = time.time()
-    peak_counts = compute_peak_hour_departure_counts(resolved)
-    peak_counts.show(10)
-    log.info("Task 3.3 complete (%.1fs)", time.time() - t1)
-
     # CORRECTION: writing final output with snapshot_date partition
     log.info("Writing final resolved movements to Parquet...")
     t_write = time.time()
@@ -971,6 +1006,25 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
     log.info("Final movements written (%.1fs)", time.time() - t_write)
     final_count = final_output.count()
     log.info("Final movements row count: %d", final_count)
+
+    # --- Task 3.2 ---
+    # TODO: assert avg_arrival_delay_min/avg_departure_delay_min type as minutes
+    log.info("Task 3.2 – Computing average daily delay per station...")
+    t1 = time.time()
+    avg_delay = compute_average_daily_delay(
+        resolved, start_date="2025-10-04", end_date="2025-10-07", station_eva=8011162
+    )
+    avg_delay.show(10)
+    log.info("Task 3.2 complete (%.1fs)", time.time() - t1)
+
+    # --- Task 3.3 ---
+    log.info("Task 3.3 – Computing average peak-hour departures per station...")
+    t1 = time.time()
+    peak_counts = compute_peak_hour_departure_counts(resolved)
+    peak_counts.show(10)
+    log.info("Task 3.3 complete (%.1fs)", time.time() - t1)
+
+    
     resolved.unpersist()
     log.info("All tasks complete (%.1fs wall time)", time.time() - t0)
 
