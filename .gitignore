@@ -3,8 +3,8 @@
 /timetable_changes/
 # Exclude folders containing parquet files
 /output/
-
-
+/logs/
+/spark-data/
 
 
 # Graph map output
