@@ -38,6 +38,7 @@ services:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
+      - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
     command: >
@@ -58,6 +59,7 @@ services:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
+      - ./DBahn-berlin:/opt/spark-data/DBahn-berlin
       - ./output:/opt/spark-data/movements:rw
       - ./logs:/opt/spark-data/logs:rw
     command: >
