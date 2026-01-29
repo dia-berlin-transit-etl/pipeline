@@ -7,10 +7,14 @@ from typing import List, Optional, Dict, Tuple
 
 import psycopg2
 
-from postgres_connector import PostgresConnector
 
 def get_conn():
-    return PostgresConnector().connect()
+    return psycopg2.connect(
+        host="localhost",
+        port=5432,
+        dbname="public_transport_db",
+        user="efe",
+    )
 
 
 def parse_snapshot_key_to_dt(k: str | int) -> datetime:
