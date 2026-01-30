@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as sf
-from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType, TimestampType, DateType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType, TimestampType
 import xml.etree.ElementTree as ET
 import logging
 import re
@@ -513,10 +513,7 @@ def derive_change_flags(df):
     )
 
 
-# ==================== RESOLVE LATEST STATE (for 3.2 & 3.3) ====================
-# TODO: save this to parquet instead of timetable/changes separately
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+# ==================== RESOLVE LATEST STATE ====================
 
 
 def resolve_latest_stop_state(timetable_df, changes_df):
@@ -526,10 +523,10 @@ def resolve_latest_stop_state(timetable_df, changes_df):
 
     # 1. Filter out NULL keys first
     timetable_df = timetable_df.filter(
-        F.col("station_eva").isNotNull() & F.col("stop_id").isNotNull()
+        sf.col("station_eva").isNotNull() & sf.col("stop_id").isNotNull()
     )
     changes_df = changes_df.filter(
-        F.col("station_eva").isNotNull() & F.col("stop_id").isNotNull()
+        sf.col("station_eva").isNotNull() & sf.col("stop_id").isNotNull()
     )
 
     # 2. Normalize column names
@@ -543,25 +540,25 @@ def resolve_latest_stop_state(timetable_df, changes_df):
         .withColumnRenamed("dp_ct", "changed_departure_ts")
         .withColumnRenamed("ar_pt", "planned_arrival_ts")
         .withColumnRenamed("dp_pt", "planned_departure_ts")
-        .withColumn("changed_arrival_ts", F.col("changed_arrival_ts").cast("timestamp"))
+        .withColumn("changed_arrival_ts", sf.col("changed_arrival_ts").cast("timestamp"))
         .withColumn(
-            "changed_departure_ts", F.col("changed_departure_ts").cast("timestamp")
+            "changed_departure_ts", sf.col("changed_departure_ts").cast("timestamp")
         )
-        .withColumn("planned_arrival_ts", F.col("planned_arrival_ts").cast("timestamp"))
+        .withColumn("planned_arrival_ts", sf.col("planned_arrival_ts").cast("timestamp"))
         .withColumn(
-            "planned_departure_ts", F.col("planned_departure_ts").cast("timestamp")
+            "planned_departure_ts", sf.col("planned_departure_ts").cast("timestamp")
         )
     )
 
     # 3. Add missing columns so schemas match
     planned_events = (
-        timetable_df.withColumn("changed_arrival_ts", F.lit(None).cast("timestamp"))
-        .withColumn("changed_departure_ts", F.lit(None).cast("timestamp"))
+        timetable_df.withColumn("changed_arrival_ts", sf.lit(None).cast("timestamp"))
+        .withColumn("changed_departure_ts", sf.lit(None).cast("timestamp"))
         # cancellation is False for planned events, not NULL
-        .withColumn("arrival_cancelled", F.lit(False).cast("boolean"))
-        .withColumn("departure_cancelled", F.lit(False).cast("boolean"))
-        .withColumn("arrival_is_hidden", F.col("arrival_is_hidden").cast("boolean"))
-        .withColumn("departure_is_hidden", F.col("departure_is_hidden").cast("boolean"))
+        .withColumn("arrival_cancelled", sf.lit(False).cast("boolean"))
+        .withColumn("departure_cancelled", sf.lit(False).cast("boolean"))
+        .withColumn("arrival_is_hidden", sf.col("arrival_is_hidden").cast("boolean"))
+        .withColumn("departure_is_hidden", sf.col("departure_is_hidden").cast("boolean"))
     )
 
     change_events = changes_df # artifact
@@ -584,10 +581,6 @@ def resolve_latest_stop_state(timetable_df, changes_df):
         "departure_is_hidden",
     ]
 
-    # CRITICAL: Filter changes-only stops that aren't marked as "added"
-    # A changes-only stop is one that exists in changes but NOT in timetables.
-    # These should only be kept if marked as added (arrival_is_added OR departure_is_added).
-    #
     # Get the set of (stop_id, station_eva) from timetables
     timetable_keys = planned_events.select("stop_id", "station_eva").distinct()
 
@@ -609,7 +602,7 @@ def resolve_latest_stop_state(timetable_df, changes_df):
     # Filter changes-only to keep only added stops
     if "arrival_is_added" in changes_df.columns and "departure_is_added" in changes_df.columns:
         changes_only_added = changes_only.filter(
-            F.col("arrival_is_added") | F.col("departure_is_added")
+            sf.col("arrival_is_added") | sf.col("departure_is_added")
         )
         log.info("Changes-only stops: %d total, %d marked as added (keeping only added)",
                  changes_only.count(), changes_only_added.count())
@@ -629,12 +622,12 @@ def resolve_latest_stop_state(timetable_df, changes_df):
 
     w_history = (
         Window.partitionBy("stop_id", "station_eva")
-        .orderBy(F.col("snapshot_key").asc_nulls_first())
+        .orderBy(sf.col("snapshot_key").asc_nulls_first())
         .rowsBetween(Window.unboundedPreceding, Window.currentRow) # should be more efficient but if it breaks restore it back to Window.unboundedFollowing 
     )
 
     w_latest = Window.partitionBy("stop_id", "station_eva").orderBy(
-        F.col("snapshot_key").desc_nulls_last()
+        sf.col("snapshot_key").desc_nulls_last()
     )
 
     normal_state_cols = [
@@ -652,181 +645,42 @@ def resolve_latest_stop_state(timetable_df, changes_df):
     # Apply last(ignorenulls=True) to ALL state columns including cancellation
     all_state_cols = normal_state_cols + ["arrival_cancelled", "departure_cancelled"]
     for c in all_state_cols:
-        events = events.withColumn(c, F.last(c, ignorenulls=True).over(w_history))
+        events = events.withColumn(c, sf.last(c, ignorenulls=True).over(w_history))
 
     resolved = (
-        events.withColumn("_rn", F.row_number().over(w_latest))
-        .filter(F.col("_rn") == 1)
+        events.withColumn("_rn", sf.row_number().over(w_latest))
+        .filter(sf.col("_rn") == 1)
         .drop("_rn")
     )
 
     # 4. Final derived fields
     resolved = (
         resolved.withColumn(
-            "actual_arrival_ts", F.coalesce("changed_arrival_ts", "planned_arrival_ts")
+            "actual_arrival_ts", sf.coalesce("changed_arrival_ts", "planned_arrival_ts")
         )
         .withColumn(
             "actual_departure_ts",
-            F.coalesce("changed_departure_ts", "planned_departure_ts"),
+            sf.coalesce("changed_departure_ts", "planned_departure_ts"),
         )
-        .withColumn("arrival_cancelled", F.coalesce("arrival_cancelled", F.lit(False)))
+        .withColumn("arrival_cancelled", sf.coalesce("arrival_cancelled", sf.lit(False)))
         .withColumn(
-            "departure_cancelled", F.coalesce("departure_cancelled", F.lit(False))
+            "departure_cancelled", sf.coalesce("departure_cancelled", sf.lit(False))
         )
-        .withColumn("arrival_is_hidden", F.coalesce("arrival_is_hidden", F.lit(False)))
+        .withColumn("arrival_is_hidden", sf.coalesce("arrival_is_hidden", sf.lit(False)))
         .withColumn(
-            "departure_is_hidden", F.coalesce("departure_is_hidden", F.lit(False))
+            "departure_is_hidden", sf.coalesce("departure_is_hidden", sf.lit(False))
         )
     )
 
     # Filter to keep only rows with meaningful data
     resolved = resolved.filter(
-        (F.col("actual_arrival_ts").isNotNull())
-        | (F.col("actual_departure_ts").isNotNull())
+        (sf.col("actual_arrival_ts").isNotNull())
+        | (sf.col("actual_departure_ts").isNotNull())
     )
 
     resolved = resolved.drop("changed_arrival_ts", "changed_departure_ts") # Final version doesn't include these
 
     return resolved
-
-
-# ==================== TASK 3.2 – Average daily delay ====================
-
-
-def compute_average_daily_delay(
-    resolved_df, start_date=None, end_date=None, station_eva=None
-):
-    """Average delay per station, excluding cancelled/hidden stops.
-
-    Operates on resolved final state (one row per stop) so each train is
-    counted once.  delay = changed_time − planned_time in minutes.
-
-    IMPORTANT: Delay is only computed when there's a changed time (ct).
-    If there's no change, the stop ran on time (or we don't know), so
-    delay is NULL, not 0.
-
-    Corresponds to fact_changed.py: _delay_minutes() (L441–L445) applied
-    inside upsert_fact_movement_from_changes_snapshot() (L755–L762).
-    """
-    if start_date:
-        resolved_df = resolved_df.filter(
-            sf.col("actual_arrival_ts")
-            >= sf.to_timestamp(sf.lit(start_date), "yyyy-MM-dd")
-        )
-    if end_date:
-        resolved_df = resolved_df.filter(
-            sf.col("actual_arrival_ts")
-            < sf.to_timestamp(sf.lit(end_date), "yyyy-MM-dd")
-        )
-    if station_eva:
-        resolved_df = resolved_df.filter(sf.col("station_eva") == station_eva)
-
-    # CRITICAL FIX: Delay = changed_time - planned_time, NOT actual - planned
-    # Only compute delay when there's actually a changed time (ct).
-    # If changed_time is NULL, delay should be NULL (not 0).
-    # This matches Python fact_changed.py:_delay_minutes() which requires
-    # both planned and changed times to be non-NULL.
-    df = resolved_df.withColumn(
-        "arrival_delay_min",
-        sf.when(
-            sf.col("actual_arrival_ts").isNotNull()
-            & sf.col("planned_arrival_ts").isNotNull()
-            & ~sf.col("arrival_cancelled")
-            & ~sf.col("arrival_is_hidden"),
-            sf.round(
-                (
-                    sf.unix_timestamp("actual_arrival_ts")
-                    - sf.unix_timestamp("planned_arrival_ts")
-                )
-                / 60.0
-            ),
-        ).cast("int"),
-    ).withColumn(
-        "departure_delay_min",
-        sf.when(
-            sf.col("actual_departure_ts").isNotNull()
-            & sf.col("planned_departure_ts").isNotNull()
-            & ~sf.col("departure_cancelled")
-            & ~sf.col("departure_is_hidden"),
-            sf.round(
-                (
-                    sf.unix_timestamp("actual_departure_ts")
-                    - sf.unix_timestamp("planned_departure_ts")
-                )
-                / 60.0
-            ),
-        ).cast("int"),
-    )
-
-    avg_arr = (
-        df.filter(sf.col("arrival_delay_min").isNotNull())
-        .groupBy("station_eva")
-        .agg(sf.round(sf.avg("arrival_delay_min"), 2).alias("avg_arrival_delay_min"))
-    )
-    avg_dep = (
-        df.filter(sf.col("departure_delay_min").isNotNull())
-        .groupBy("station_eva")
-        .agg(
-            sf.round(sf.avg("departure_delay_min"), 2).alias("avg_departure_delay_min")
-        )
-    )
-
-    joined = avg_arr.join(avg_dep, "station_eva", "outer")
-    return joined.fillna(
-        {
-            "avg_arrival_delay_min": 0.0,
-            "avg_departure_delay_min": 0.0,
-        }
-    )
-
-
-# ==================== TASK 3.3 – Peak-hour departures ====================
-
-
-def compute_peak_hour_departure_counts(resolved_df):
-    """Average number of departures per station during peak hours
-    (07:00–09:00, 17:00–19:00), excluding cancelled/hidden departures.
-
-    Uses resolved final state: actual departure = changed if available, else planned.
-    No direct counterpart in fact_planned.py / fact_changed.py (query-only logic).
-
-    Days with no peak hour departures count as 0 (not omitted from average).
-    """
-    # Get all valid departures (not cancelled, not hidden)
-    valid_departures = resolved_df.filter(
-        sf.col("actual_departure_ts").isNotNull()
-        & ~sf.col("departure_cancelled")
-        & ~sf.col("departure_is_hidden")
-    ).withColumn("dep_date", sf.to_date("actual_departure_ts"))
-
-    # Get all (station_eva, date) combinations with any departure
-    all_station_dates = valid_departures.select("station_eva", "dep_date").distinct()
-
-    # Filter to peak hours only
-    peak = valid_departures.filter(
-        (
-            (sf.hour("actual_departure_ts") >= 7)
-            & (sf.hour("actual_departure_ts") < 9)
-        )
-        | (
-            (sf.hour("actual_departure_ts") >= 17)
-            & (sf.hour("actual_departure_ts") < 19)
-        )
-    )
-
-    # Count peak departures per station per day
-    peak_daily = peak.groupBy("station_eva", "dep_date").agg(
-        sf.count("*").alias("daily_departure_count")
-    )
-
-    # Left join to include days with 0 peak departures
-    daily_with_zeros = all_station_dates.join(
-        peak_daily, ["station_eva", "dep_date"], "left"
-    ).fillna(0, subset=["daily_departure_count"])
-
-    return daily_with_zeros.groupBy("station_eva").agg(
-        sf.avg("daily_departure_count").alias("avg_peak_hour_departures_per_day")
-    )
 
 
 # ==================== MAIN ====================
@@ -875,7 +729,7 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
         )
     )
 
-    # --- Task 3.1: Load ---
+    # --- Load ---
 
     log.info("Writing timetables parquet...")
     t1 = time.time()
@@ -928,25 +782,6 @@ def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.jso
     final_count = final_output.count()
     log.info("Final movements row count: %d", final_count)
     resolved.unpersist()
-
-    # --- Task 3.2 ---
-    log.info("Task 3.2 – Computing average daily delay per station...")
-    t1 = time.time()
-    avg_delay = compute_average_daily_delay(
-        final_output,
-        start_date="2025-10-04",
-        end_date="2025-10-07",
-        station_eva=8011162,
-    )
-    avg_delay.show(10)
-    log.info("Task 3.2 complete (%.1fs)", time.time() - t1)
-
-    # --- Task 3.3 ---
-    log.info("Task 3.3 – Computing average peak-hour departures per station...")
-    t1 = time.time()
-    peak_counts = compute_peak_hour_departure_counts(final_output)
-    peak_counts.show(10)
-    log.info("Task 3.3 complete (%.1fs)", time.time() - t1)
     final_output.unpersist()
 
     log.info("All tasks complete (%.1fs wall time)", time.time() - t0)
