@@ -41,10 +41,6 @@ def to_station_search_name(name: str) -> str:
     return s
 
 
-
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-
 def compute_avg_daily_delay(
     df,
     *,
@@ -247,11 +243,11 @@ def main():
     ).show(50, truncate=False)
 
     base.select(
-        F.count("*").alias("rows"),
-        F.sum(F.col("changed_arrival_ts").isNotNull().cast("int")).alias("n_changed_arr"),
-        F.sum(F.col("changed_departure_ts").isNotNull().cast("int")).alias("n_changed_dep"),
-        F.sum(F.col("actual_arrival_ts").isNotNull().cast("int")).alias("n_actual_arr"),
-        F.sum(F.col("actual_departure_ts").isNotNull().cast("int")).alias("n_actual_dep"),
+        sf.count("*").alias("rows"),
+        sf.sum(sf.col("changed_arrival_ts").isNotNull().cast("int")).alias("n_changed_arr"),
+        sf.sum(sf.col("changed_departure_ts").isNotNull().cast("int")).alias("n_changed_dep"),
+        sf.sum(sf.col("actual_arrival_ts").isNotNull().cast("int")).alias("n_actual_arr"),
+        sf.sum(sf.col("actual_departure_ts").isNotNull().cast("int")).alias("n_actual_dep"),
     ).show(truncate=False)
 
 
