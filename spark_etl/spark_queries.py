@@ -33,8 +33,8 @@ def compute_avg_daily_delay(
           .filter(sf.col("snapshot_date") <  sf.to_date(sf.lit(end_date)))
     )
 
-    arr_obs_ts = sf.col("changed_arrival_ts") if not use_fallback else sf.coalesce(sf.col("changed_arrival_ts"), sf.col("actual_arrival_ts"))
-    dep_obs_ts = sf.col("changed_departure_ts") if not use_fallback else sf.coalesce(sf.col("changed_departure_ts"), sf.col("actual_departure_ts"))
+    arr_obs_ts = sf.col("actual_arrival_ts")
+    dep_obs_ts = sf.col("actual_departure_ts")
 
     arrival_delay_min = (arr_obs_ts.cast("long") - sf.col("planned_arrival_ts").cast("long")) / sf.lit(60.0)
     departure_delay_min = (dep_obs_ts.cast("long") - sf.col("planned_departure_ts").cast("long")) / sf.lit(60.0)
@@ -88,42 +88,17 @@ def compute_avg_daily_delay(
 
 
 def main():
-    #traindep = get_avg_number_train_dep(movementDf)
-    #traindep.show()
-    #avg_daily_delay = get_avg_daily_delay(movementDf, 8011155)
-
-
     path_to_movements_parquet = "file:///opt/spark-data/movements/final_movements"
 
     spark = SparkSession.builder.appName("Berlin Public Transport").getOrCreate()
 
+    spark.sparkContext.setLogLevel("WARN")
+
     df = spark.read.parquet(path_to_movements_parquet)
-    dim_station_df = spark.read.parquet("/opt/spark-data/movements/dim_station")
-    #df.filter(sf.col('station_eva').isNull()).show()
 
-
-    # 2) Sanity: do we even have rows for this station + window?
     station_eva = 8011162
     start_date = "2025-09-02"
     end_date = "2025-10-16"
-    #start_date = "2025-10-04"
-    #end_date = "2025-10-07"
-
-    base = (
-        df.filter(sf.col("station_eva") == sf.lit(station_eva))
-          .filter(sf.col("snapshot_date") >= sf.to_date(sf.lit(start_date)))
-          .filter(sf.col("snapshot_date") <  sf.to_date(sf.lit(end_date)))
-    )
-
-    print("rows in window for station =", base.count())
-
-    base.select(
-        sf.count("*").alias("rows"),
-        sf.sum(sf.col("changed_arrival_ts").isNotNull().cast("int")).alias("n_changed_arr"),
-        sf.sum(sf.col("changed_departure_ts").isNotNull().cast("int")).alias("n_changed_dep"),
-        sf.sum(sf.col("actual_arrival_ts").isNotNull().cast("int")).alias("n_actual_arr"),
-        sf.sum(sf.col("actual_departure_ts").isNotNull().cast("int")).alias("n_actual_dep"),
-    ).show(truncate=False)
 
 
     daily, overall = compute_avg_daily_delay(
@@ -134,8 +109,10 @@ def main():
         use_fallback=True,
     )
 
-    daily.show(50, truncate=False)
     overall.show(truncate=False)
+
+    peak_hour_dep_counts = compute_peak_hour_departure_counts(df)
+    peak_hour_dep_counts.show(peak_hour_dep_counts.count(), False)
 
 
     spark.stop()
