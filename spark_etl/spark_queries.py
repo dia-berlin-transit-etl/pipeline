@@ -1,44 +1,5 @@
-import re
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as sf
-from pyspark.sql.window import Window
-
-
-def to_station_search_name(name: str) -> str:
-    """
-    Search helper string used for pg_trgm / fuzzystrmatch lookups.
-    """
-    s = (name or "").strip().lower()
-
-    # German folding (more robust for fuzzy matching / filenames)
-    s = (s.replace("ß", "s") # not ss but s
-           .replace("ä", "a")
-           .replace("ö", "o")
-           .replace("ü", "u"))
-
-    # If filenames use '_' as a placeholder inside words (e.g. s_d for süd),
-    # don't turn it into a space — remove it when it's between word chars.
-    s = re.sub(r"(?<=\w)_(?=\w)", "", s)
-
-    # hbf (word + suffix)
-    s = re.sub(r"\bhbf\b\.?", " hauptbahnhof ", s)
-    s = re.sub(r"(?<=\w)hbf\b\.?", "hauptbahnhof", s)
-
-    # bf (word + suffix) — suffix excludes "...hbf"
-    s = re.sub(r"\bbf\b\.?", " bahnhof ", s)
-    s = re.sub(r"(?<=\w)(?<!h)bf\b\.?", "bahnhof", s)
-
-    # str (word + suffix)
-    s = re.sub(r"\bstr\b\.?", " strase ", s)
-    s = re.sub(r"(?<=\w)str\b\.?", "strase", s)
-    s = re.sub(r"\b(\w+)\s+strase\b", r"\1strase", s)
-
-    s = re.sub(r"\bberlin\b", " ", s)
-
-    # Keep underscore already handled; now strip everything else to spaces
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
 
 
 def compute_peak_hour_departure_counts(resolved_df):
@@ -138,6 +99,7 @@ def main():
 
     df = spark.read.parquet(path_to_movements_parquet)
     dim_station_df = spark.read.parquet("/opt/spark-data/movements/dim_station")
+    #df.filter(sf.col('station_eva').isNull()).show()
 
 
     # 2) Sanity: do we even have rows for this station + window?
@@ -169,7 +131,7 @@ def main():
         start_date=start_date,
         end_date=end_date,
         station_eva=station_eva,
-        use_fallback=True,   # IMPORTANT with your data (changed_* is mostly NULL)
+        use_fallback=True,
     )
 
     daily.show(50, truncate=False)
@@ -177,6 +139,8 @@ def main():
 
 
     spark.stop()
+
+
     
     
 
