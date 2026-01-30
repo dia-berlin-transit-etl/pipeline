@@ -576,3 +576,22 @@ The `actual_departure_ts` is derived by prioritizing the changed timestamp (wher
 For each station and day, we count the number of such departures. Since some stations may have no activity on certain days within those time ranges, we left-join the counts to the complete set of all station–day pairs, filling missing counts with 0. Finally, the data are aggregated to compute the average daily number of peak-hour departures per station.
 
 The corresponding Spark implementation is provided in the function `compute_peak_hour_departure_counts` in `..\spark_etl\spark_queries.py`.
+
+# Task 4: Graph
+
+## 4.1
+
+The file `/graph/graph_setup.py` builds an undirected NetworkX graph from Postgres:
+- Nodes: all stations from `dw.dim_station` (EVA as node id, name + lat/lon as attributes).
+- Edges: planned topology from `dw.fact_movement` using only baseline snapshots (`dw.dim_time.minute = 0`), connecting `previous_station_eva <-> station_eva` and `station_eva <-> next_station_eva` (skipping hidden arrival/departure sides).  
+
+For each edge we attach small metadata (sample train category/number, a sample snapshot/stop_id, and how often the edge appears across trains/snapshots).
+
+Exports an interactive Folium HTML map showing nodes and edges and supports shortest path (fewest hops) between two station names via `nx.shortest_path`.
+
+## 4.2
+
+The file `/graph/earliest_arrival.py` computes earliest arrival time given:
+- source station name, target station name, and a departure time key `YYMMDDHHmm`.
+
+It loads the latest known state as-of that snapshot from `dw.fact_movement`, builds timed ride legs by grouping stops per `(train_id, service_date)`, and then runs the _Connection Scan Algorithm (CSA)_ to find the earliest reachable arrival. It prints the resulting route as a list of ride legs with departure/arrival times.
