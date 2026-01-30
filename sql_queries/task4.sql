@@ -1,17 +1,9 @@
--- given a station name, 
--- return the average train delay in that station.
--------------------------------------------------------------------------------
-
-
--- pick the station row once
 WITH st AS (
   SELECT station_eva, station_name
   FROM dw.dim_station
-  WHERE station_name = 'Berlin-Friedrichshagen'  -- input station name
+  WHERE station_name = :station_name  -- input name should be changed
 ),
 
--- for each movement key `(station_eva, stop_id)` at that station get the most recent one
---  `(station_eva, stop_id)` is taken as key because these two do identify a stop for a certain time-window since stop_id embeds time data and additional info so the same stop from different days wont have the same stop_id
 latest AS (
   SELECT DISTINCT ON (fm.station_eva, fm.stop_id)
     fm.station_eva,
@@ -27,10 +19,6 @@ latest AS (
   ORDER BY fm.station_eva, fm.stop_id, fm.snapshot_key DESC, fm.movement_key DESC
 ),
 
--- Each row in `latest` has two possible delays:
--- arrival delay or departure delay
--- But sql avg() expects a single column stream of numbers
--- so we build a list of delay numbers called delay_obs
 delay_obs AS (
   SELECT arrival_delay_min AS delay_min
   FROM latest

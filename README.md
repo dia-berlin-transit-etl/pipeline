@@ -1,28 +1,43 @@
-# Pipeline
+# DIA Exercise WiSe 25/26 Alternative Exercise
+
+- Oguz Efe Sonugür - 411575
+
+- Selin Kahvecioglu - 414169
+
+- Valeriia Ivasheva - 530262
 
 ## Initial Setup
 
-Extract the content you unzip from the folders `/DBahn-berlin/timetable` and `/DBahn-berlin/timetable_changes` respectively into folders named `/timetable` and `/timetable_changes`. So the folder structure looks like the following:
+Our code assumes `/timetable` and `/timetable_changes` are in the main directory.
 
-```
-.
-├── DBahn-berlin
-│   ├── ...
-│   ├── timetable_changes
-│   └── timetables
-├── ...
-├── timetable_changes
-└── timetables
+The python dependencies are given inside the file `requirements.txt`.
+
+Setup docker by running this command inside the directory:
+```sh
+docker compose up -d
 ```
 
-The folders `/timetable` and `/timetable_changes` will be gitignored.
+The bash script `rebuild_and_ingest.sh` is responsible for everything related to Task 1.
 
-## Star schema design (DW schema `dw`)
+Make it executable:
+```sh
+chmod +x rebuild_and_ingest.sh
+```
 
-<!-- ![Schema ERD](schema_erd.png) -->
-<!--<img src="schema_erd.png" alt="Schema ERD" width="600" /> -->
+Run it:
+```sh
+./rebuild_and_ingest.sh
+```
 
-An image of the ERD of our schema is provided in the appendix.
+
+Note: We include `station_data.json` inside our directory and changed the names of two stations (Yorckstrasse S1 and S2) as suggested in the ISIS-forum. 
+
+Disclaimer: Some scripts assume `station_data.json` is in the main directory and some assume that is is under the folder `DBahn-berlin`, for which reason we have two of these files.
+
+## Task 1.1: Star schema design (DW schema `dw`)
+
+
+An image of the ERD of our schema is provided in the appendix (Figure 1).
 
 Our warehouse follows a star-schema layout with one central fact table (`dw.fact_movement`) and three core dimensions (`dw.dim_station`, `dw.dim_train`, `dw.dim_time`). The fact table stores the observed state of train movements per snapshot, while dimensions provide descriptive context for analysis.
 
@@ -57,21 +72,20 @@ Our warehouse follows a star-schema layout with one central fact table (`dw.fact
 
 - **`dw.station_resolve_log`** records every station name resolution attempt (raw string, normalized string, best match, similarity score, and whether it was auto-linked).
 
-> [!NOTE] Important
-> Check appendix for details on our logic for matching station names.
+
+> **Check appendix for details on our logic for matching station names.**
 
 - **`dw.needs_review`** stores unresolved or low-confidence station strings for manual inspection.
 
-These tables are not part of the analytical star schema (and not included in the image above), but support data quality and debugging.
+These tables are not part of the analytical star schema (and not included in the image in the appendix), but support data quality and debugging.
 
 ### Indices
 
 - A trigram GIN index on `dim_station.station_name_search` accelerates fuzzy station lookup during ingestion.
 - The composite index `(station_eva, stop_id, snapshot_key DESC)` on `fact_movement` accelerates "latest as-of snapshot" lookups, which are required to chain timetable changes on to the most recent available state.
 
----
 
-# Documentation for the python pipeline
+# Task 1.2
 
 ## Ingesting station data (`etl/stations.py`)
 
@@ -253,121 +267,37 @@ Each as-of row is unique by `(snapshot_key, station_eva, stop_id)`. We upsert on
 This design allows querying a stop's evolution by selecting all rows for the same `(station_eva, stop_id)` ordered by `snapshot_key`, where each row represents the state "as of" that snapshot.
 
 
-
-
+---
 
 ## Task 2: SQL Queries
 
+The corresponding SQL-queries are provided under the folder `/sql_queries`.
 ### 2.1
 
-```sql
-SELECT station_eva, station_name, lon, lat
-FROM dw.dim_station
-WHERE station_name = '...';
-```
+`:station_name` should be given by the user input inside the file `/sql_queries/task1.sql`.
 
 We store coordinate information in the table `dim_station` as `lon` and `lat`, which makes it straightforward to return these. `station_eva` is returned as well which is the primary key to the table `dim_station`.
 
 ### 2.2
 
-```sql
-PREPARE get_closest_station(double precision, double precision) AS
-SELECT station_eva, station_name, lon, lat
-FROM dw.dim_station
-ORDER BY (
-  power(lat - $1, 2) +
-  power((lon - $2) * cos(radians($1)), 2)
-)
-LIMIT 1;
-```
+The latitude and longitude should be the user input inside the file `/sql_queries/task2.sql`.
 
 We select the same fields as the previous task and we order them by measuring the euclidian distance of the _equirectangular approximation_ of the coordinates. We return the top row with `LIMIT 1`.
 
 ### 2.3
 
-```sql
-WITH params AS (
-  SELECT '...'::text AS s  -- snapshot S
-),
-latest AS (
-  SELECT DISTINCT ON (fm.station_eva, fm.stop_id)
-    fm.station_eva,
-    fm.stop_id,
-    fm.train_id,
-    fm.arrival_cancelled,
-    fm.departure_cancelled
-  FROM dw.fact_movement fm
-  JOIN params p ON true
-  WHERE fm.snapshot_key <= p.s
-  ORDER BY fm.station_eva, fm.stop_id, fm.snapshot_key DESC, fm.movement_key DESC
-),
-canceled_station_train AS (
-  SELECT DISTINCT
-    station_eva,
-    train_id
-  FROM latest
-  WHERE arrival_cancelled OR departure_cancelled
-)
-SELECT
-  COUNT(*) AS cancellations_per_station_total
-FROM canceled_station_train;
-
-```
+`:snapshot` should be given by the user input inside the file `/sql_queries/task3.sql`.
 
 To count cancellations at a given snapshot cutoff `S`, we treat `dw.fact_movement` as an "as-of" fact table and first restrict rows to `snapshot_key <= S`. Because each stop `(station_eva, stop_id)` can appear in multiple snapshots (planned baseline plus later updates), we select the most recent row per movement using `DISTINCT ON ... ORDER BY snapshot_key DESC`. We then keep only rows where either `arrival_cancelled` or `departure_cancelled` is true. To follow the requirement "count a train cancelled once per station", we deduplicate by `(station_eva, train_id)` and finally count these distinct station-train pairs. This yields the number of trains that are cancelled at each station according to the latest available state up to snapshot `S`.
 
 ### 2.4
 
-```sql
-WITH st AS (
-  SELECT station_eva, station_name
-  FROM dw.dim_station
-  WHERE station_name = '...'  -- input station name
-),
-
-latest AS (
-  SELECT DISTINCT ON (fm.station_eva, fm.stop_id)
-    fm.station_eva,
-    fm.stop_id,
-    fm.arrival_delay_min,
-    fm.departure_delay_min,
-    fm.arrival_cancelled,
-    fm.departure_cancelled,
-    fm.arrival_is_hidden,
-    fm.departure_is_hidden
-  FROM dw.fact_movement fm
-  JOIN st ON st.station_eva = fm.station_eva
-  ORDER BY fm.station_eva, fm.stop_id, fm.snapshot_key DESC, fm.movement_key DESC
-),
-
-delay_obs AS (
-  SELECT arrival_delay_min AS delay_min
-  FROM latest
-  WHERE arrival_delay_min IS NOT NULL
-    AND arrival_delay_min >= 0
-    AND arrival_cancelled = FALSE
-    AND arrival_is_hidden = FALSE
-
-  UNION ALL
-
-  SELECT departure_delay_min AS delay_min
-  FROM latest
-  WHERE departure_delay_min IS NOT NULL
-    AND departure_delay_min >= 0
-    AND departure_cancelled = FALSE
-    AND departure_is_hidden = FALSE
-)
-SELECT
-  st.station_name,
-  st.station_eva,
-  AVG(delay_min)::double precision AS avg_delay_min,
-  COUNT(*) AS n_delay_observations
-FROM delay_obs
-JOIN st ON true
-GROUP BY st.station_name, st.station_eva;
-```
+`:station_name` should be given by the user input inside the file `/sql_queries/task4.sql`.
 
 To compute the average delay for a station, we first resolve the station name to its `station_eva` in `dw.dim_station`. Since `dw.fact_movement` stores multiple "as-of" rows over time for the same stop, we collapse the timeline by selecting the most recent row per movement key `(station_eva, stop_id)` using `DISTINCT ON ... ORDER BY snapshot_key DESC`. From these latest rows, we extract delay observations from both arrival and departure (`arrival_delay_min`, `departure_delay_min`) and union them into a single stream of numbers. We exclude invalid observations by filtering out `NULL` delays, negative delays, cancelled events, and hidden events. Finally, we compute `AVG(delay_min)` and report the number of included observations as a sanity check.
+
+
+---
 
 # Task 3.1 Spark Architecture & ETL Flow
 
@@ -405,7 +335,7 @@ For the extraction of the xml files we use `sparkContext.wholeTextFiles`, to ha
 
 **A. Station Identity Resolution (Backfilling):**
 It implements a simplified version of station name matching used in Task 1.2
-Since timetable lacks the `station_eva` that we use as the primary key. This function implements a two-stage name matching against a look up table from the reference (`station_data.json`) to recover the station_eva:
+Since timetable lacks the `station_eva` that we use as the primary key. This function implements a two-stage name matching against a look up table from the reference (`DBahn-berlin/station_data.json`) to recover the station_eva:
 
 1. **Normalizied Exact Match:** Station names are normalized (e.g., "Berlin-Tegel (S)" $\rightarrow$ "tegel s") to ensure consistent matching, using the same Python UDF `to_station_search_name()` for Task 1.2. Then direct join against the normalized lookup table.
 2. **Fuzzy Match:** For remaining unmatched records, a combined match score is applied (taking the max score after threshold filtering):
@@ -431,21 +361,12 @@ Unlike `fact_movement`finalized table `movements/final_movements` that is to be 
 
 Possible enhancement would be to write the partitions like the dataset folder structure where we would have a intermediary folder for each week and inside the parquets with each day of that week. Since we already have larger tables (15 mins of each station vs 1 day of every station) we have decided to keep this simplified folder structure for the storage.
 
----
 
 ## Data Schema
 
-### Input Schemas
 
-The name of the fields kept in shortened form for consistency with the xml contents.
+You can find the images of our input and output schema in the appendix (Figure 2&3).
 
-<img src="input.webp" alt="input" width=700/>
-
-### Output Schema (`final_movements`)
-
-<img src="output.webp" alt="output" width=400/>
-
----
 
 # Task 3.2 & 3.3
 
@@ -463,7 +384,7 @@ We load the Parquet dataset from Task 3.1 into a Spark DataFrame and restrict th
 
 Finally, the overall average daily delay for the station is computed as the mean of daily average delays.
 
-The corresponding Spark implementation is provided in the function `compute_avg_daily_delay` in `..\spark_etl\spark_queries.py`.
+The corresponding Spark implementation is provided in the function `compute_avg_daily_delay` in `/spark_etl/spark_queries.py`.
 
 **2. Peak-Hour Traffic Density:**
 
@@ -476,11 +397,19 @@ The `actual_departure_ts` is derived by prioritizing the changed timestamp (wher
 
 For each station and day, we count the number of such departures. Since some stations may have no activity on certain days within those time ranges, we left-join the counts to the complete set of all station–day pairs, filling missing counts with 0. Finally, the data are aggregated to compute the average daily number of peak-hour departures per station.
 
-The corresponding Spark implementation is provided in the function `compute_peak_hour_departure_counts` in `..\spark_etl\spark_queries.py`.
+The corresponding Spark implementation is provided in the function `compute_peak_hour_departure_counts` in `/spark_etl/spark_queries.py`.
+
+---
 
 # Task 4: Graph
 
 ## 4.1
+
+```sh
+python -m graph.graph_setup # run the script for task 4.1
+xdg-open stations_map.html # view graph on browser
+```
+You can adjust variables in `main()` to change start- and end-stations.
 
 The file `/graph/graph_setup.py` builds an undirected NetworkX graph from Postgres:
 - Nodes: all stations from `dw.dim_station` (EVA as node id, name + lat/lon as attributes).
@@ -492,11 +421,18 @@ Exports an interactive Folium HTML map showing nodes and edges and supports shor
 
 ## 4.2
 
+```sh
+python -m graph.earliest_arrival.py # run the script for task 4.2
+```
+You can adjust variables in `main()` to change start- and end-stations.
+
 The file `/graph/earliest_arrival.py` computes earliest arrival time given:
 - source station name, target station name, and a departure time key `YYMMDDHHmm`.
 
 It loads the latest known state as-of that snapshot from `dw.fact_movement`, builds timed ride legs by grouping stops per `(train_id, service_date)`, and then runs the _Connection Scan Algorithm (CSA)_ to find the earliest reachable arrival. It prints the resulting route as a list of ride legs with departure/arrival times.
 
+
+---
 
 # Appendix: 
 
@@ -530,7 +466,7 @@ Normalization steps (in order):
 - German character folding:
   - `ß -> s`, `ä -> a`, `ö -> o`, `ü -> u`
 - special handling for underscores inside words (used as umlaut placeholders in filenames):
-  - `s_d → sd` (underscore removed only when between word characters)
+  - `s_d -> sd` (underscore removed only when between word characters)
 - expand/normalize common abbreviations:
   - `hbf -> hauptbahnhof`
   - `bf -> bahnhof` (excluding "hbf")
@@ -612,3 +548,15 @@ The resolver is used in three places:
    - Same path logic, stored in `changed_previous_station_eva` / `changed_next_station_eva`
 
 In all cases, the same normalization + pg_trgm matching + auditing logic is applied, so station identity is consistent across planned and changes ingestion.
+
+
+## Figure 2: Input Schema for Task 3.1
+
+The name of the input schema fields kept in shortened form for consistency with the xml contents.
+
+<img src="input.webp" alt="input" width=700/>
+
+
+
+## Figure 3: Output Schema for Task 3.1
+<img src="output.webp" alt="output" width=300/>

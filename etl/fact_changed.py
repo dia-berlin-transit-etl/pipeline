@@ -20,9 +20,8 @@ GENERIC = {
 }
 
 
-# ----------------------------
+
 # Parsing helpers
-# ----------------------------
 
 def parse_yyMMddHHmm(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
@@ -54,9 +53,8 @@ def _core_search_string(station_search: str) -> str:
     return " ".join(toks)
 
 
-# ----------------------------
-# Station name normalization (MUST match dim_station.station_name_search)
-# ----------------------------
+
+# Station name normalization (match dim_station.station_name_search)
 
 def to_station_search_name(name: str) -> str:
     s = (name or "").strip().lower()
@@ -97,9 +95,9 @@ def station_name_from_timetable_filename(xml_path: str) -> str:
     return stem
 
 
-# ----------------------------
+
 # dim_train helpers
-# ----------------------------
+
 
 def load_train_map(cur) -> Dict[Tuple[str, str], int]:
     cur.execute("select train_id, category, train_number from dw.dim_train;")
@@ -143,9 +141,9 @@ def get_or_create_train_id(cur, train_map: Dict[Tuple[str, str], int], *, catego
     return tid
 
 
-# ----------------------------
+
 # Station resolve (pg_trgm)
-# ----------------------------
+
 
 def resolve_station_eva(
     cur,
@@ -296,9 +294,9 @@ def get_station_eva_for_changes_file(
     )
 
 
-# ----------------------------
+
 # Snapshot discovery (changes)
-# ----------------------------
+
 
 def iter_change_snapshots(timetable_changes_root: str = "timetable_changes") -> Iterator[str]:
     for p in glob.glob(os.path.join(timetable_changes_root, "**", "[0-9]" * 10), recursive=True):
@@ -312,9 +310,9 @@ def changes_glob_for_snapshot(snapshot_key: str, timetable_changes_root: str = "
     return os.path.join(timetable_changes_root, "**", snapshot_key, "*.xml")
 
 
-# ----------------------------
+
 # dim_time upsert (needed for FK)
-# ----------------------------
+
 
 def ensure_dim_time(cur, snapshot_key: str) -> None:
     ts = parse_yyMMddHHmm(snapshot_key)
@@ -334,9 +332,9 @@ def ensure_dim_time(cur, snapshot_key: str) -> None:
     )
 
 
-# ----------------------------
+
 # Changes parsing
-# ----------------------------
+
 
 def _cancel_update_from_cs(el: Optional[ET.Element]) -> Optional[bool]:
     """
@@ -445,9 +443,9 @@ def _delay_minutes(planned: Optional[datetime], changed: Optional[datetime]) -> 
     return int(round(delta.total_seconds() / 60.0))
 
 
-# ----------------------------
+
 # Core ingestion (ONE changes snapshot)
-# ----------------------------
+
 
 def upsert_fact_movement_from_changes_snapshot(
     cur,
@@ -515,28 +513,28 @@ def upsert_fact_movement_from_changes_snapshot(
                 or (idx is not None and idx >= 100)
             )
 
-            # --- train id (needed for added stops with no base; also fine for normal changes)
+
             tl = s.find("tl")
             cat = (tl.get("c") or "").strip() if tl is not None else ""
             num = (tl.get("n") or "").strip() if tl is not None else ""
             train_id = get_or_create_train_id(cur, train_map, category=cat, number=num)
 
-            # --- cancel updates from cs (carry-forward logic is applied later)
+
             ar_cancel_update = _cancel_update_from_cs(ar)
             dp_cancel_update = _cancel_update_from_cs(dp)
 
-            # --- times
+            # times
             ar_ct = _parse_changed_time(ar)
             dp_ct = _parse_changed_time(dp)
 
             ar_pt = _parse_planned_time(ar)
             dp_pt = _parse_planned_time(dp)
 
-            # --- hidden flags
+
             ar_hidden = _is_hidden(ar)
             dp_hidden = _is_hidden(dp)
 
-            # --- path (use cpth else ppth)
+            # path (use cpth else ppth)
             prev_raw, next_raw = _prev_next_from_any_path(ar=ar, dp=dp)
 
             changed_prev_eva: Optional[int] = None
@@ -599,7 +597,6 @@ def upsert_fact_movement_from_changes_snapshot(
 
     wanted_list = list(change_map.keys())
 
-    # Fetch latest base row <= snapshot_key for each key (including those created by earlier changes snapshots)
     cur.execute(
         """
         with wanted(station_eva, stop_id) as (
@@ -650,8 +647,8 @@ def upsert_fact_movement_from_changes_snapshot(
         pt_ar = ch.get("planned_arrival_ts_from_pt")
         pt_dp = ch.get("planned_departure_ts_from_pt")
 
-        changed_ar_ts: Optional[datetime] = ch.get("changed_arrival_ts")  # type: ignore[assignment]
-        changed_dp_ts: Optional[datetime] = ch.get("changed_departure_ts")  # type: ignore[assignment]
+        changed_ar_ts: Optional[datetime] = ch.get("changed_arrival_ts")  
+        changed_dp_ts: Optional[datetime] = ch.get("changed_departure_ts")
 
         ar_update = ch.get("arrival_cancel_update")   # Optional[bool]
         dp_update = ch.get("departure_cancel_update") # Optional[bool]
@@ -663,7 +660,7 @@ def upsert_fact_movement_from_changes_snapshot(
         xml_dp_hidden = bool(ch.get("departure_is_hidden"))
 
         if base is None:
-            # Only allowed if it's an "added stop" (or if you want to accept orphan changes; you said you want added).
+            # Only allowed if it's an "added stop" 
             if not is_added:
                 continue
 
@@ -725,7 +722,6 @@ def upsert_fact_movement_from_changes_snapshot(
             )
             continue
 
-        # --- Normal path (base exists): chain changes on top of latest <= snapshot_key
         (
             _base_station_eva,
             _base_stop_id,
@@ -740,8 +736,6 @@ def upsert_fact_movement_from_changes_snapshot(
             base_dp_cancelled,
         ) = base
 
-        # For added stops that already exist from an earlier snapshot:
-        # if planned_* are missing and pt exists now, backfill (safe because planned_* are "planned context").
         if planned_ar_ts is None and isinstance(pt_ar, datetime):
             planned_ar_ts = pt_ar
         if planned_dp_ts is None and isinstance(pt_dp, datetime):
@@ -852,9 +846,7 @@ def upsert_fact_movement_from_changes_snapshot(
     return len(out_rows)
 
 
-# ----------------------------
 # Ingest ALL changes snapshots
-# ----------------------------
 
 def upsert_fact_movement_from_all_timetable_changes(
     cur,

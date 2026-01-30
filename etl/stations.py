@@ -13,14 +13,13 @@ def to_station_search_name(name: str) -> str:
     """
     s = (name or "").strip().lower()
 
-    # German folding (more robust for fuzzy matching / filenames)
+    # German folding 
     s = (s.replace("ß", "s") # not ss but s
            .replace("ä", "a")
            .replace("ö", "o")
            .replace("ü", "u"))
 
-    # If filenames use '_' as a placeholder inside words (e.g. s_d for süd),
-    # don't turn it into a space — remove it when it's between word chars.
+    
     s = re.sub(r"(?<=\w)_(?=\w)", "", s)
 
     # hbf (word + suffix)
@@ -38,7 +37,7 @@ def to_station_search_name(name: str) -> str:
 
     s = re.sub(r"\bberlin\b", " ", s)
 
-    # Keep underscore already handled; now strip everything else to spaces
+    
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
