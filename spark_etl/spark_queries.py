@@ -72,18 +72,16 @@ def get_avg_number_train_dep1(df):
         .groupBy('station').avg('dep_count').withColumnRenamed('avg(dep_count)', 'avg_dep_count')
     return avg_departure_by_station
 
-def get_daily_delay_averages(df, station):
+def get_daily_delay_averages(df, station_eva):
     #station = to_station_search_name(station)
     df = df.withColumns({
-            "arr_delay_min": sf.when(sf.col("planned_arrival_ts").isNull(), None)
-                               .when(sf.col("changed_arrival_ts").isNotNull(), sf.floor((sf.unix_timestamp("changed_arrival_ts") - sf.unix_timestamp("planned_arrival_ts")) / 60))
-                               .otherwise(0),
-            "dep_delay_min": sf.when(sf.col("planned_departure_ts").isNull(), None)
-                               .when(sf.col("changed_departure_ts").isNotNull(), sf.floor((sf.unix_timestamp("changed_departure_ts") - sf.unix_timestamp("planned_departure_ts")) / 60))
-                               .otherwise(0)
+            "arr_delay_min": sf.when(sf.col("changed_arrival_ts").isNotNull(), sf.floor((sf.unix_timestamp("changed_arrival_ts") - sf.unix_timestamp("planned_arrival_ts")) / 60))
+                               .otherwise(None),
+            "dep_delay_min": sf.when(sf.col("changed_departure_ts").isNotNull(), sf.floor((sf.unix_timestamp("changed_departure_ts") - sf.unix_timestamp("planned_departure_ts")) / 60))
+                               .otherwise(None)
         })
     
-    daily_delays = df.filter(sf.col('station_eva') == station)\
+    daily_delays = df.filter(sf.col('station_eva') == station_eva)\
         .filter(((sf.col('arr_delay_min').isNotNull()) & (sf.col('arr_delay_min') >= 0) & (~sf.col('arrival_cancelled')) & (~sf.col('arrival_is_hidden'))) | \
                 ((sf.col('dep_delay_min').isNotNull()) & (sf.col('dep_delay_min') >= 0) & (~sf.col('departure_cancelled')) & (~sf.col('departure_is_hidden')))) \
         .fillna(0, subset=['arr_delay_min', 'dep_delay_min']) \

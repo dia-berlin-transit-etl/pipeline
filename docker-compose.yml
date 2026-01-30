@@ -34,12 +34,12 @@ services:
     ports:
       - "7077:7077"
       - "8080:8080"
+      - "4040:4040"
     volumes:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
-      - ./output:/opt/spark-data/movements:rw
-      - ./logs:/opt/spark-data/logs:rw
+      - ./output:/opt/spark-data/output:rw
     command: >
       bash -c "mkdir -p /opt/spark/work-dir/.ivy2 &&
                /opt/spark/sbin/start-master.sh &&
@@ -58,8 +58,7 @@ services:
       - ./spark_etl/:/opt/spark-apps 
       - ./timetables/:/opt/spark-data/timetables
       - ./timetable_changes/:/opt/spark-data/timetable_changes
-      - ./output:/opt/spark-data/movements:rw
-      - ./logs:/opt/spark-data/logs:rw
+      - ./output:/opt/spark-data/output:rw
     command: >
       bash -c "mkdir -p /opt/spark/work-dir/.ivy2 &&
                /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
