@@ -98,6 +98,9 @@ The pipeline includes built-in analytical modules (Tasks 3.2 & 3.3) that operate
 
 **1. Average Daily Delay Calculation:**
 
+Since exercise sheet did not specified the input format, we are assuming the input is station_eva.
+
+
 - **Logic:** $Delay = Actual\_Time - Planned\_Time$.
     
 - The pipeline differentiates between On Time (no change record) and Delayed. It calculates delay only when a changed time exists.
