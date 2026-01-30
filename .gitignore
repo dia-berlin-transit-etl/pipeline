@@ -1,6 +1,11 @@
 # Exclude folders containing the decompressed data
 /timetables/
 /timetable_changes/
+# Exclude folders containing parquet files
+/output/
+/logs/
+/spark-data/
+
 
 # Graph map output
 stations_map.html
@@ -146,7 +151,7 @@ celerybeat.pid
 .envrc
 .venv
 env/
-venv/
+*venv/
 ENV/
 env.bak/
 venv.bak/
