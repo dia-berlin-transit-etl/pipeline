@@ -12,36 +12,99 @@
 ## Task 3.2
 
 ```python
-def get_daily_delay_averages(df, station):
-    # station = to_station_search_name(station)
-    daily_delays = df.filter(sf.col('station') == station)\
-        .filter(((sf.col('arr_delay_min').isNotNull()) & (sf.col('arr_delay_min') >= 0) & (~sf.col('arr_cancelled')) & (~sf.col('arr_hi'))) | \
-                ((sf.col('dep_delay_min').isNotNull()) & (sf.col('dep_delay_min') >= 0) & (~sf.col('dep_cancelled')) & (~sf.col('dep_hi')))) \
-        .fillna(0, subset=['arr_delay_min', 'dep_delay_min']) \
-        .withColumn('delay_min', sf.col('arr_delay_min') + sf.col('dep_delay_min')) \
-        .groupBy('snapshot_date').avg('delay_min').withColumnRenamed('avg(delay_min)', 'delay_average')
+def compute_avg_daily_delay(
+    df,
+    *,
+    start_date: str,
+    end_date: str,
+    station_eva: int,
+    use_fallback: bool = True,
+):
+    base = (
+        df.filter(sf.col("station_eva") == sf.lit(int(station_eva)))
+          .filter(sf.col("snapshot_date") >= sf.to_date(sf.lit(start_date)))
+          .filter(sf.col("snapshot_date") <  sf.to_date(sf.lit(end_date)))
+    )
 
-    return daily_delays
+    arr_obs_ts = sf.col("actual_arrival_ts")
+    dep_obs_ts = sf.col("actual_departure_ts")
 
-def get_avg_daily_delay(df, station):
-    avg_daily_delay = get_daily_delay_averages(df, station).select(sf.avg('delay_average'))
-    avg_daily_delay.show()
-    return avg_daily_delay.collect()[0]
+    arrival_delay_min = (arr_obs_ts.cast("long") - sf.col("planned_arrival_ts").cast("long")) / sf.lit(60.0)
+    departure_delay_min = (dep_obs_ts.cast("long") - sf.col("planned_departure_ts").cast("long")) / sf.lit(60.0)
 
-path_to_movements_parquet = "/opt/spark-data/movements"
+    base = (
+        base
+        .withColumn("arrival_delay_min", sf.when(arr_obs_ts.isNotNull() & sf.col("planned_arrival_ts").isNotNull(), arrival_delay_min))
+        .withColumn("departure_delay_min", sf.when(dep_obs_ts.isNotNull() & sf.col("planned_departure_ts").isNotNull(), departure_delay_min))
+    )
+
+    arr_obs = (
+        base
+        .select("snapshot_date", sf.col("arrival_delay_min").alias("delay_min"))
+        .where(sf.col("delay_min").isNotNull())
+        .where(sf.col("delay_min") >= 0)
+        .where(sf.coalesce(sf.col("arrival_cancelled"), sf.lit(False)) == sf.lit(False))
+        .where(sf.coalesce(sf.col("arrival_is_hidden"), sf.lit(False)) == sf.lit(False))
+    )
+    dep_obs = (
+        base
+        .select("snapshot_date", sf.col("departure_delay_min").alias("delay_min"))
+        .where(sf.col("delay_min").isNotNull())
+        .where(sf.col("delay_min") >= 0)
+        .where(sf.coalesce(sf.col("departure_cancelled"), sf.lit(False)) == sf.lit(False))
+        .where(sf.coalesce(sf.col("departure_is_hidden"), sf.lit(False)) == sf.lit(False))
+    )
+    delay_obs = arr_obs.unionByName(dep_obs)
+
+
+    daily = (
+        delay_obs.groupBy("snapshot_date")
+        .agg(
+            sf.avg("delay_min").alias("daily_avg_delay_min"),
+            sf.count("*").alias("n_delay_observations"),
+        )
+        .orderBy("snapshot_date")
+    )
+
+    overall = (
+        daily.agg(
+            sf.avg("daily_avg_delay_min").alias("avg_daily_delay_min"),
+            sf.sum("n_delay_observations").alias("total_delay_observations"),
+            sf.count("*").alias("n_days"),
+        )
+        .withColumn("station_eva", sf.lit(int(station_eva)))
+        .select("station_eva", "avg_daily_delay_min", "n_days", "total_delay_observations")
+    )
+
+    return daily, overall
+
+path_to_movements_parquet = "file:///opt/spark-data/movements/final_movements"
+
 spark = SparkSession.builder.appName("Berlin Public Transport").getOrCreate()
-movementDf = spark.read.parquet(path_to_movements_parquet)
 
-station = 'alexanderplatz' #change for a given station,
+df = spark.read.parquet(path_to_movements_parquet)
 
-avg_dayily_delay = get_avg_daily_delay(movementDf, station)
+station_eva = 8011162
+start_date = "2025-09-02"
+end_date = "2025-10-16"
+
+daily, overall = compute_avg_daily_delay(
+        df,
+        start_date=start_date,
+        end_date=end_date,
+        station_eva=station_eva,
+        use_fallback=True,
+    )
+
+daily.show(50, truncate=False)
+overall.show(truncate=False)
 
 spark.stop()
 ```
 
-We read a resulting Parquet dataset from Task 3.1 into `movementDf`, also normalize the given station name to search. To find the average daily delay for a station over the collected period at fist we compute `daily_delays` as average of delays per day, then average over these days.
+We load the Parquet dataset from Task 3.1 into a Spark DataFrame. To find the average daily delay for a station over the time period at first we compute `daily` as average of delays per day, then average over these days.
 
-To compute `daily_delays` we exclude invalid observations by filtering out `NULL` delays, negative delays, cancelled events, and hidden events. Since it could be only arrival or departure was delayed we fill null values of `arr_delay_min`, `dep_delay_min` as 0, then we compute complete train delay `delay_min = arr_delay_min + dep_delay_min` and get average delay min by observed day.
+To compute `daily` we exclude invalid observations by filtering out `NULL` delays, negative delays, cancelled events, and hidden events. Since it could be only arrival or departure was delayed we fill null values of `arr_delay_min`, `dep_delay_min` as 0, then we compute complete train delay `delay_min = arr_delay_min + dep_delay_min` and get average delay min by observed day.
 
 ## Task 3.3
 
