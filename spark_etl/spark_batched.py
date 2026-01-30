@@ -28,7 +28,7 @@ def test_distributed_write(spark, path):
         raise
 
 
-# ==================== SCHEMAS (Task 3.1) ====================
+# ----------------------- SCHEMAS (Task 3.1) -----------------------
 # Three schemas are defined:
 # - TIMETABLE_SCHEMA: Raw planned timetable data from XML
 # - CHANGES_SCHEMA: Raw changes data from XML
@@ -40,13 +40,13 @@ TIMETABLE_SCHEMA = StructType([
     StructField("station_eva", LongType()),
     StructField("station_name", StringType()),
     StructField("stop_id", StringType()),
-    StructField("category", StringType()),       # tl@c  (fact_planned: cat)
-    StructField("train_number", StringType()),    # tl@n  (fact_planned: num)
-    StructField("owner", StringType()),           # tl@o
-    StructField("ar_pt", StringType()),           # ar@pt (raw YYMMDDHHmm)
-    StructField("dp_pt", StringType()),           # dp@pt (raw YYMMDDHHmm)
-    StructField("arrival_is_hidden", BooleanType()),   # ar hi="1"
-    StructField("departure_is_hidden", BooleanType()), # dp hi="1"
+    StructField("category", StringType()),       
+    StructField("train_number", StringType()),    
+    StructField("owner", StringType()),           
+    StructField("ar_pt", StringType()),           
+    StructField("dp_pt", StringType()),           
+    StructField("arrival_is_hidden", BooleanType()),   
+    StructField("departure_is_hidden", BooleanType()), 
 ])
 
 CHANGES_SCHEMA = StructType(
@@ -58,21 +58,21 @@ CHANGES_SCHEMA = StructType(
         StructField("category", StringType()),
         StructField("train_number", StringType()),
         StructField("owner", StringType()),
-        StructField("ar_pt", StringType()),  # ar@pt
-        StructField("ar_ct", StringType()),  # ar@ct (changed time)
-        StructField("ar_ps", StringType()),  # ar@ps (planned status)
-        StructField("ar_cs", StringType()),  # ar@cs (cancellation status)
+        StructField("ar_pt", StringType()),  
+        StructField("ar_ct", StringType()),  
+        StructField("ar_ps", StringType()),  
+        StructField("ar_cs", StringType()),  
         StructField(
             "ar_clt", StringType()
-        ),  # ar@clt (cancellation time) - REQUIRED for valid cancellation
+        ), 
         StructField("arrival_is_hidden", BooleanType()),
-        StructField("dp_pt", StringType()),  # dp@pt
-        StructField("dp_ct", StringType()),  # dp@ct
-        StructField("dp_ps", StringType()),  # dp@ps
-        StructField("dp_cs", StringType()),  # dp@cs
+        StructField("dp_pt", StringType()),  
+        StructField("dp_ct", StringType()),  
+        StructField("dp_ps", StringType()),  
+        StructField("dp_cs", StringType()),  
         StructField(
             "dp_clt", StringType()
-        ),  # dp@clt (cancellation time) - REQUIRED for valid cancellation
+        ),
         StructField("departure_is_hidden", BooleanType()),
         StructField("is_added_by_suffix", BooleanType()),
     ]
@@ -99,7 +99,7 @@ MOVEMENT_SCHEMA = StructType(
     ]
 )
 
-# ==================== PARSING (Task 3.1 – Extract) ====================
+# ----------------- PARSING (Task 3.1 - Extract) -----------------
 # Each parser runs inside mapPartitions: one task per batch of XMLs
 # Snapshot key is derived from the folder path (YYMMDDHHmm).
 
@@ -282,7 +282,7 @@ def parse_changes_partition(iterator):
             continue
 
 
-# ==================== ETL HELPERS (Task 3.1) ====================
+# ------------------------ ETL HELPERS (Task 3.1) ------------------------
 
 def extract(spark, path, parser, schema, min_partitions):
     """Read XMLs via wholeTextFiles, parse with mapPartitions, return DataFrame."""
@@ -513,7 +513,7 @@ def derive_change_flags(df):
     )
 
 
-# ==================== RESOLVE LATEST STATE ====================
+# ------------------------- RESOLVE LATEST STATE -------------------------
 
 
 def resolve_latest_stop_state(timetable_df, changes_df):
@@ -521,7 +521,7 @@ def resolve_latest_stop_state(timetable_df, changes_df):
     Resolve the latest state for each (stop_id, station_eva) pair.
     """
 
-    # 1. Filter out NULL keys first
+    # 1. Filter out NULL keys
     timetable_df = timetable_df.filter(
         sf.col("station_eva").isNotNull() & sf.col("stop_id").isNotNull()
     )
@@ -585,14 +585,14 @@ def resolve_latest_stop_state(timetable_df, changes_df):
     timetable_keys = planned_events.select("stop_id", "station_eva").distinct()
 
 
-    # Changes that have a timetable entry - keep these
+    # Changes that have a timetable entry: keep these
     changes_with_timetable = change_events.join(
         timetable_keys,
         ["stop_id", "station_eva"],
         "inner"
     )
 
-    # Changes that DON'T have a timetable entry - only keep if added
+    # Changes that DON'T have a timetable entry: only keep if added
     changes_only = change_events.join(
         timetable_keys,
         ["stop_id", "station_eva"],
@@ -683,7 +683,7 @@ def resolve_latest_stop_state(timetable_df, changes_df):
     return resolved
 
 
-# ==================== MAIN ====================
+# -------------- MAIN --------------
 
 
 def main(spark, station_data_path="/opt/spark-data/DBahn-berlin/station_data.json"):
