@@ -545,9 +545,9 @@ The pipeline includes built-in analytical modules (Tasks 3.2 & 3.3) that operate
 Since exercise sheet did not specified the input format, we are assuming the input is station_eva.
 
 
-- **Logic:** `Delay = Actual\_Time - Planned\_Time`.
+- **Logic:** `delay = actual_time - planned_time`.
     
-- The pipeline differentiates between On Time (no change record) and Delayed. It calculates delay only when a changed time exists.
+- The query differentiates between On Time (no change record) and Delayed. It calculates delay only when a changed time exists.
     
 - **Exclusions:** Cancelled stops and "hidden" operational stops are excluded from the average.
 
