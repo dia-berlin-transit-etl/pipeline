@@ -2,6 +2,9 @@
 
 ## A description of ETL pipeline
 
+- We create a station lookup DataFrame with station name → EVA mappings from `station_data.json`. Result: a small lookup table (~133 rows for Berlin stations) with normalized
+  station names for joining.
+
 ## The resulting schema
 
 # Spark queries
@@ -43,33 +46,35 @@ To compute `daily_delays` we exclude invalid observations by filtering out `NULL
 ## Task 3.3
 
 ```python
-def get_avg_number_train_dep(df):
-   stations = df.select('station').distinct()
+def compute_peak_hour_departure_counts(resolved_df):
+    stations = resolved_df.select('station_eva').distinct()
+    df = resolved_df.filter(
+        sf.col("actual_departure_ts").isNotNull()
+        & ~sf.col("departure_cancelled")
+        & ~sf.col("departure_is_hidden")) \
+        .withColumns({'actual_dep_hour': sf.hour(sf.col('actual_departure_ts')), 'actual_dep_day': sf.to_date(sf.col('actual_departure_ts'))})
+    dep_days = df.select('actual_dep_day').distinct()
+    all_dep_and_station_pairs = stations.crossJoin(dep_days)
+    departures_by_peak_hours = df.filter(sf.col('actual_dep_hour').isin([7,8,17,18]))
+    departures_by_peak_hours = departures_by_peak_hours.groupBy('station_eva', 'actual_dep_day').count().withColumnRenamed('count', 'dep_count')
+    avg_departure_by_station = all_dep_and_station_pairs.join(departures_by_peak_hours, ['actual_dep_day', 'station_eva'], 'left') \
+        .fillna(0, 'dep_count') \
+        .groupBy('station_eva').avg('dep_count').withColumnRenamed('avg(dep_count)', 'avg_dep_count')
+    return avg_departure_by_station
 
-   df = df.filter((~sf.col('dep_cancelled')) & (~sf.col('dep_hi')) & (sf.col('dep_pt').isNotNull()) & (~sf.lower(sf.col('train_category')).contains('bus'))) \
-       .dropDuplicates(['stop_id', 'station', 'dep_pt']) \
-       .withColumn('actual_dep', sf.when(sf.col('dep_ct').isNotNull(), sf.col('dep_ct')).otherwise(sf.col('dep_pt'))) \
-       .withColumns({'actual_dep_hour': sf.hour(sf.col('actual_dep')), 'actual_dep_day': sf.to_date(sf.col('actual_dep'))})
 
-   dep_days = df.select('actual_dep_day').distinct()
-   all_dep_and_station_pairs = stations.crossJoin(dep_days)
-   departures_by_peak_hours = df.filter(sf.col('actual_dep_hour').isin([7,8,17,18]))
-   departures_by_peak_hours = departures_by_peak_hours.groupBy('station', 'actual_dep_day').count().withColumnRenamed('count', 'dep_count')
-   avg_departure_by_station = all_dep_and_station_pairs.join(departures_by_peak_hours, ['actual_dep_day', 'station'], 'left') \
-       .fillna(0, 'dep_count') \
-       .groupBy('station').avg('dep_count').withColumnRenamed('avg(dep_count)', 'avg_dep_count')
-   return avg_departure_by_station
-
-
-path_to_movements_parquet = "/opt/spark-data/movements"
+path_to_movements_parquet = "file:///opt/spark-data/movements/final_movements"
 spark = SparkSession.builder.appName("Berlin Public Transport").getOrCreate()
-movementDf = spark.read.parquet(path_to_movements_parquet)
+df = spark.read.parquet(path_to_movements_parquet)
 
-
-avg_number_train_dep = get_avg_number_train_dep(movementDf)
+avg_number_train_dep = compute_peak_hour_departure_counts(df)
 
 spark.stop()
 
 ```
 
-We read a resulting Parquet dataset from Task 3.1 into `movementDf`. To compute the average number of train departures per station during peak hours we exclude invalid observations by filtering out cancelled and hidden departure events, records without planned departure times, and non-train services such as buses. As an intermeidate step we compute `actual_dep` as `dep_ct` if it exists else `dep_pt`, from which `actual_dep_hour` and `actual_dep_day` are extracted. We take only train departures during peak hours (07:00 to 09:00 and 17:00 to 19:00) `('actual_dep_hour').isin([7,8,17,18])` and for each station and day, we count the number of such departures. Since it might be that a station does not appear on a given day within those time ranges, we left-join the counts to the complete set of all station–day pairs, fill missing counts with 0, and finally compute the average daily number of peak-hour departures per station.
+We load the Parquet dataset from Task 3.1 into a Spark DataFrame. To compute the average number of train departures per station during peak hours, we first pre-process the data by filtering out cancelled or hidden departure events and records missing a planned departure time.
+
+The `actual_departure_ts` is derived by prioritizing the changed timestamp (where available) over the planned one. From this value, we extract the hour and date. The dataset is then filtered for peak hours (07:00–09:00 and 17:00–19:00).
+
+For each station and day, we count the number of such departures. Since some stations may have no activity on certain days within those time ranges, we left-join the counts to the complete set of all station–day pairs, filling missing counts with 0. Finally, we aggregate the data to compute the average daily number of peak-hour departures per station.
