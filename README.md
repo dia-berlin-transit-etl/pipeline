@@ -1,10 +1,4 @@
-# DIA Exercise WiSe 25/26 Alternative Exercise
-
-- Oguz Efe Sonugür - 411575
-
-- Selin Kahvecioglu - 414169
-
-- Valeriia Ivasheva - 530262
+# DB Train Movements Pipeline
 
 ## Initial Setup
 
@@ -34,7 +28,7 @@ Note: We include `station_data.json` inside our directory and changed the names 
 
 Disclaimer: Some scripts assume `station_data.json` is in the main directory and some assume that is is under the folder `DBahn-berlin`, for which reason we have two of these files.
 
-## Task 1.1: Star schema design (DW schema `dw`)
+## Star schema design (DW schema `dw`)
 
 
 An image of the ERD of our schema is provided in the appendix (Figure 1).
@@ -85,7 +79,6 @@ These tables are not part of the analytical star schema (and not included in the
 - The composite index `(station_eva, stop_id, snapshot_key DESC)` on `fact_movement` accelerates "latest as-of snapshot" lookups, which are required to chain timetable changes on to the most recent available state.
 
 
-# Task 1.2
 
 ## Ingesting station data (`etl/stations.py`)
 
@@ -269,28 +262,28 @@ This design allows querying a stop's evolution by selecting all rows for the sam
 
 ---
 
-## Task 2: SQL Queries
+## SQL Queries
 
 The corresponding SQL-queries are provided under the folder `/sql_queries`.
-### 2.1
+### 1
 
 `:station_name` should be given by the user input inside the file `/sql_queries/task1.sql`.
 
 We store coordinate information in the table `dim_station` as `lon` and `lat`, which makes it straightforward to return these. `station_eva` is returned as well which is the primary key to the table `dim_station`.
 
-### 2.2
+### 2
 
 The latitude and longitude should be the user input inside the file `/sql_queries/task2.sql`.
 
 We select the same fields as the previous task and we order them by measuring the euclidian distance of the _equirectangular approximation_ of the coordinates. We return the top row with `LIMIT 1`.
 
-### 2.3
+### 3
 
 `:snapshot` should be given by the user input inside the file `/sql_queries/task3.sql`.
 
 To count cancellations at a given snapshot cutoff `S`, we treat `dw.fact_movement` as an "as-of" fact table and first restrict rows to `snapshot_key <= S`. Because each stop `(station_eva, stop_id)` can appear in multiple snapshots (planned baseline plus later updates), we select the most recent row per movement using `DISTINCT ON ... ORDER BY snapshot_key DESC`. We then keep only rows where either `arrival_cancelled` or `departure_cancelled` is true. To follow the requirement "count a train cancelled once per station", we deduplicate by `(station_eva, train_id)` and finally count these distinct station-train pairs. This yields the number of trains that are cancelled at each station according to the latest available state up to snapshot `S`.
 
-### 2.4
+### 4
 
 `:station_name` should be given by the user input inside the file `/sql_queries/task4.sql`.
 
@@ -299,7 +292,7 @@ To compute the average delay for a station, we first resolve the station name to
 
 ---
 
-# Task 3.1 Spark Architecture & ETL Flow
+# Spark Architecture & ETL Flow
 
 Utilizing Apache Spark, the pipeline ingests raw XML, resolves data quality issues (missing identifiers), merges planned schedules with live updates, and produces a Parquet dataset for delay analysis and traffic density queries.
 
@@ -314,7 +307,7 @@ spark-submit \
   spark_batched.py
 ```
 
-Queries for Task 3.2 and 3.3
+Queries:
 
 ```
 spark-submit \
@@ -368,9 +361,9 @@ Possible enhancement would be to write the partitions like the dataset folder st
 You can find the images of our input and output schema in the appendix (Figure 2&3).
 
 
-# Task 3.2 & 3.3
+# Spark Queries
 
-The pipeline includes built-in analytical modules (Tasks 3.2 & 3.3) that operate on the resolved data.
+The pipeline includes built-in analytical modules that operate on the resolved data.
 
 **1. Average Daily Delay Calculation:**
 
@@ -380,7 +373,7 @@ Since the exercise sheet did not specify the input format, we are assuming the i
 - The query differentiates between On Time (no change record) and Delayed. It calculates delay only when a changed time exists.
 - **Exclusions:** Cancelled stops and "hidden" operational stops are excluded from the average.
 
-We load the Parquet dataset from Task 3.1 into a Spark DataFrame and restrict the data to a given station and observation period. Arrival and departure delays are computed independently in minutes as the difference between actual and planned timestamps. Invalid observations are then excluded by filtering out `NULL` delays, negative delays, cancelled events, and hidden events. Arrival and departure delay observations are combined into a single dataset and grouped by day to compute the average delay per day.
+We load the Parquet dataset from into a Spark DataFrame and restrict the data to a given station and observation period. Arrival and departure delays are computed independently in minutes as the difference between actual and planned timestamps. Invalid observations are then excluded by filtering out `NULL` delays, negative delays, cancelled events, and hidden events. Arrival and departure delay observations are combined into a single dataset and grouped by day to compute the average delay per day.
 
 Finally, the overall average daily delay for the station is computed as the mean of daily average delays.
 
@@ -401,7 +394,7 @@ The corresponding Spark implementation is provided in the function `compute_peak
 
 ---
 
-# Task 4: Graph
+# Graph Logic
 
 ## 4.1
 
@@ -550,7 +543,7 @@ The resolver is used in three places:
 In all cases, the same normalization + pg_trgm matching + auditing logic is applied, so station identity is consistent across planned and changes ingestion.
 
 
-## Figure 2: Input Schema for Task 3.1
+## Figure 2: Input Schema for Spark
 
 The name of the input schema fields kept in shortened form for consistency with the xml contents.
 
@@ -558,5 +551,5 @@ The name of the input schema fields kept in shortened form for consistency with 
 
 
 
-## Figure 3: Output Schema for Task 3.1
+## Figure 3: Output Schema for Spark
 <img src="output.webp" alt="output" width=300/>
